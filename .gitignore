@@ -1,0 +1,26 @@
+
+# AT-ODE generated datasets and outputs
+data/simbench/
+results/
+experiments/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Environments and secrets
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Editor files
+.vscode/
+.idea/
+.DS_Store
