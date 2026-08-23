@@ -460,10 +460,22 @@ class RepositoryAttentionTransportAdapter(nn.Module):
 
         cache = self.transport(
             z0=z0,
-            latest_observation_time=latest_observation_time,
+            latest_observation_time=(
+                latest_observation_time.squeeze(-1)
+                if latest_observation_time.ndim == 3
+                and latest_observation_time.shape[-1] == 1
+                else latest_observation_time
+            ),
             time_grid=time_grid,
-            physical_edge_mask=physical_edge_mask,
+            physical_edge_mask=(
+                physical_edge_mask.squeeze(-1)
+                if physical_edge_mask is not None
+                and physical_edge_mask.ndim == 3
+                and physical_edge_mask.shape[-1] == 1
+                else physical_edge_mask
+            ),
         )
+
 
         return {
             "provider": cache.edge_weights_at,

@@ -888,7 +888,10 @@ def _make_graph_solver(
     ode_function.model_type = config.model_name
     ode_function.physical_edge_index = edge_index
     ode_function.edge_weight_mode = edge_weight_mode
-    ode_function.edge_weight_provider = edge_weight_provider
+    # The trainable transport module is owned and registered by
+    # DiffeqSolver. GraphODEFunc receives only the temporary per-solve
+    # cache query callable inside DiffeqSolver.forward().
+    ode_function.edge_weight_provider = None
 
     return solver
 
