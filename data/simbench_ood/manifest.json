@@ -1,0 +1,14 @@
+{
+  "codes": [
+    "1-MV-rural--1-sw"
+  ],
+  "files": [
+    {
+      "metadata": "data\\simbench_ood\\1-MV-rural--1-sw.json",
+      "npz": "data\\simbench_ood\\1-MV-rural--1-sw.npz",
+      "npz_sha256": "b65121c24bd54fbda5495c171b205867a5d32eae9e9ee50c1da517fe9b68d4cf"
+    }
+  ],
+  "format_version": 2,
+  "generated_utc": "2026-08-23T00:45:50.628167+00:00"
+}
