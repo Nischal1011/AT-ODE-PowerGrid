@@ -26,7 +26,7 @@ By default:
     Use the posterior mean as z0.
 
 This makes validation, checkpoint selection, and test evaluation deterministic.
-The behavior can be overridden explicitly with ``sample_posterior``.
+The behavior can be controlled explicitly with ``sample_z0``.
 
 Interpolation note
 ------------------
@@ -580,16 +580,10 @@ class LatentGraphODE(VAE_Baseline):
         first_point_mu: Tensor,
         first_point_std: Tensor,
         n_traj_samples: int,
-        sample_posterior: Optional[bool],
+        sample_z0: bool,
     ) -> Tuple[Tensor, bool]:
         """
         Construct latent initial states.
-
-        If ``sample_posterior`` is None, posterior sampling follows the module
-        mode:
-
-        * training mode: sample;
-        * evaluation mode: use the posterior mean.
         """
 
         if isinstance(n_traj_samples, bool) or not isinstance(
@@ -605,14 +599,12 @@ class LatentGraphODE(VAE_Baseline):
                 "n_traj_samples must be at least one."
             )
 
-        if sample_posterior is None:
-            should_sample = bool(self.training)
-        elif isinstance(sample_posterior, bool):
-            should_sample = sample_posterior
-        else:
+        if not isinstance(sample_z0, bool):
             raise TypeError(
-                "sample_posterior must be True, False, or None."
+                "sample_z0 must be True or False."
             )
+
+        should_sample = sample_z0
 
         # Shape:
         # means_z0:  [S, B*N, latent_dim]
@@ -819,7 +811,7 @@ class LatentGraphODE(VAE_Baseline):
         batch_de,
         batch_g=None,
         n_traj_samples=1,
-        sample_posterior: Optional[bool] = None,
+        sample_z0: bool = True,
     ):
         """
         Reconstruct or forecast trajectories.
@@ -839,7 +831,7 @@ class LatentGraphODE(VAE_Baseline):
         n_traj_samples:
             Number of latent trajectories.
 
-        sample_posterior:
+        sample_z0:
             Posterior initial-state policy:
 
             * True:
@@ -847,10 +839,6 @@ class LatentGraphODE(VAE_Baseline):
 
             * False:
                 Use posterior mean deterministically.
-
-            * None:
-                Sample when ``self.training`` is True and use the posterior
-                mean when ``self.training`` is False.
 
         Returns
         -------
@@ -887,7 +875,7 @@ class LatentGraphODE(VAE_Baseline):
                 first_point_mu,
                 first_point_std,
                 n_traj_samples,
-                sample_posterior,
+                sample_z0,
             )
         )
 

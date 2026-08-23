@@ -130,6 +130,7 @@ from torch import Tensor
 import lib.powergrid_model_factory as powergrid_factory
 from lib.powergrid_model_factory import (
     SUPPORTED_POWERGRID_MODELS,
+    assert_lgode_atode_protocol_match,
     build_powergrid_lgode_model,
     count_total_parameters,
     count_trainable_parameters,
@@ -802,6 +803,7 @@ def compute_training_loss(
             batch,
             n_traj_samples=n_traj_samples,
             kl_coef=kl_coefficient,
+            sample_z0=True,
         )
 
     batch_size = int(batch.target_values.shape[0])
@@ -817,6 +819,7 @@ def compute_training_loss(
         graph_labels,
         n_traj_samples=n_traj_samples,
         kl_coef=kl_coefficient,
+        sample_z0=True,
     )
 
 
@@ -859,6 +862,7 @@ def predict_batch(
         graph_decoder_dictionary(batch),
         graph_labels,
         n_traj_samples=n_traj_samples,
+        sample_z0=False,
     )
 
     predictions = graph_prediction_to_powergrid_shape(
@@ -1045,6 +1049,7 @@ def evaluate(
     feature_names: Sequence[str],
     device: torch.device,
     *,
+    task: str,
     n_traj_samples: int,
     evaluation_seed: int,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -1057,7 +1062,11 @@ def evaluate(
 
     model.eval()
 
-    accumulator = MetricAccumulator(
+    full_accumulator = MetricAccumulator(
+        normalization=normalization,
+        feature_names=feature_names,
+    )
+    unobserved_accumulator = MetricAccumulator(
         normalization=normalization,
         feature_names=feature_names,
     )
@@ -1103,16 +1112,54 @@ def evaluate(
             # The predictive mean is the authoritative evaluation prediction.
             mean_prediction = samples.mean(dim=0)
 
-            accumulator.update(
+            full_accumulator.update(
                 mean_prediction,
                 batch.target_values,
                 batch.target_mask,
             )
 
+            if task == "interpolation":
+                expected_observed_shape = batch.target_values.shape[:3]
+                if tuple(batch.observed_event_mask.shape) != tuple(
+                    expected_observed_shape
+                ):
+                    raise ValueError(
+                        "Interpolation observed_event_mask must have shape "
+                        f"[B,N,T]={tuple(expected_observed_shape)}; got "
+                        f"{tuple(batch.observed_event_mask.shape)}."
+                    )
+                unobserved_mask = (
+                    ~batch.observed_event_mask.to(dtype=torch.bool)
+                ).unsqueeze(-1).expand_as(batch.target_values)
+                unobserved_mask = unobserved_mask & batch.target_mask.bool()
+            else:
+                unobserved_mask = batch.target_mask.bool()
+
+            unobserved_accumulator.update(
+                mean_prediction,
+                batch.target_values,
+                unobserved_mask,
+            )
+
             if diagnostics:
                 last_diagnostics = diagnostics
 
-    return accumulator.compute(), last_diagnostics
+    full_metrics = full_accumulator.compute()
+    unobserved_metrics = unobserved_accumulator.compute()
+    metrics = dict(full_metrics)
+    metrics.update(
+        {
+            "normalized_mse_full": full_metrics["normalized_mse"],
+            "normalized_mae_full": full_metrics["normalized_mae"],
+            "normalized_mse_unobserved": unobserved_metrics[
+                "normalized_mse"
+            ],
+            "normalized_mae_unobserved": unobserved_metrics[
+                "normalized_mae"
+            ],
+        }
+    )
+    return metrics, last_diagnostics
 
 
 # ---------------------------------------------------------------------------
@@ -1814,7 +1861,7 @@ def run_experiment(
         )
     )
 
-    if args.model == "atode":
+    if args.model in {"lgode", "atode"}:
         install_transport_factory_adapter(args)
 
     # The transport implementation operates over complete non-self candidate
@@ -1833,6 +1880,22 @@ def run_experiment(
         args=args,
         device=device,
     )
+
+    if args.model in {"lgode", "atode"}:
+        counterpart_name = "atode" if args.model == "lgode" else "lgode"
+        counterpart = build_powergrid_lgode_model(
+            model_name=counterpart_name,
+            input_dim=archive.input_dim,
+            num_nodes=archive.num_nodes,
+            edge_index=model_edge_index,
+            args=args,
+            device=device,
+        )
+        if args.model == "lgode":
+            assert_lgode_atode_protocol_match(model, counterpart)
+        else:
+            assert_lgode_atode_protocol_match(counterpart, model)
+        del counterpart
 
     canonicalize_graph_model_runtime(
         model,
@@ -1906,13 +1969,17 @@ def run_experiment(
             loaders.normalization,
             archive.bus_feature_names,
             device,
+            task=args.task,
             n_traj_samples=1,
             evaluation_seed=args.eval_seed,
         )
 
-        best_validation_mse = float(
-            validation_metrics["normalized_mse"]
+        checkpoint_metric = (
+            "normalized_mse_unobserved"
+            if args.task == "interpolation"
+            else "normalized_mse_full"
         )
+        best_validation_mse = float(validation_metrics[checkpoint_metric])
         best_validation_epoch = 0
         training_time_seconds = 0.0
 
@@ -1962,13 +2029,17 @@ def run_experiment(
                 loaders.normalization,
                 archive.bus_feature_names,
                 device,
+                task=args.task,
                 n_traj_samples=args.eval_samples,
                 evaluation_seed=args.eval_seed,
             )
 
-            validation_mse = float(
-                validation_metrics["normalized_mse"]
+            checkpoint_metric = (
+                "normalized_mse_unobserved"
+                if args.task == "interpolation"
+                else "normalized_mse_full"
             )
+            validation_mse = float(validation_metrics[checkpoint_metric])
 
             scheduler.step(validation_mse)
 
@@ -2055,7 +2126,7 @@ def run_experiment(
 
         best_validation_epoch = int(checkpoint["epoch"])
         best_validation_mse = float(
-            checkpoint["validation_metrics"]["normalized_mse"]
+            checkpoint["validation_metrics"][checkpoint_metric]
         )
 
         # Recompute validation only to report the restored model consistently.
@@ -2067,6 +2138,7 @@ def run_experiment(
             loaders.normalization,
             archive.bus_feature_names,
             device,
+            task=args.task,
             n_traj_samples=args.eval_samples,
             evaluation_seed=args.eval_seed,
         )
@@ -2082,6 +2154,7 @@ def run_experiment(
         loaders.normalization,
         archive.bus_feature_names,
         device,
+        task=args.task,
         n_traj_samples=(
             1 if args.model == "persistence"
             else args.eval_samples
@@ -2186,7 +2259,7 @@ def run_experiment(
                 if args.model == "persistence"
                 else str(checkpoint_path)
             ),
-            "selected_using": "validation.normalized_mse",
+            "selected_using": f"validation.{checkpoint_metric}",
             "test_used_for_selection": False,
         },
         "protocol": {
