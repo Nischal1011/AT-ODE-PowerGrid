@@ -605,7 +605,7 @@ def canonicalize_graph_model_runtime(
 
 
 # ---------------------------------------------------------------------------
-# Complete candidate-pair graph
+# Physical candidate-edge graph
 # ---------------------------------------------------------------------------
 
 def build_candidate_graph(
@@ -613,21 +613,15 @@ def build_candidate_graph(
     physical_edge_index: Tensor,
 ) -> Tuple[Tensor, Tensor]:
     """
-    Build complete directed non-self candidate pairs.
-
-    Ordering exactly matches DiffeqSolver.compute_rec_send():
-
-        receiver 0: sender 1, sender 2, ...
-        receiver 1: sender 0, sender 2, ...
-        ...
+    Use the physical directed edges as the graph-model candidate pairs.
 
     Returns
     -------
     candidate_edge_index:
-        [2, N*(N-1)], with row zero containing senders and row one receivers.
+        [2, E], identical to the physical directed edge index.
 
     candidate_edge_labels:
-        [N*(N-1)], where one means a physical edge and zero means no edge.
+        [E], with every physical edge marked active.
     """
 
     physical_edge_index = torch.as_tensor(
@@ -649,55 +643,36 @@ def build_candidate_graph(
             "physical_edge_index must have shape [2,E] or [E,2]."
         )
 
-    physical_pairs = {
-        (
-            int(physical_edge_index[0, edge].item()),
-            int(physical_edge_index[1, edge].item()),
-        )
-        for edge in range(physical_edge_index.shape[1])
-        if int(physical_edge_index[0, edge].item())
-        != int(physical_edge_index[1, edge].item())
-    }
-
-    senders = []
-    receivers = []
-    labels = []
-
-    for receiver in range(num_nodes):
-        for sender in range(num_nodes):
-            if sender == receiver:
-                continue
-
-            senders.append(sender)
-            receivers.append(receiver)
-            labels.append(
-                1 if (sender, receiver) in physical_pairs else 0
-            )
-
-    candidate_edge_index = torch.tensor(
-        [senders, receivers],
-        dtype=torch.long,
-    )
-    candidate_edge_labels = torch.tensor(
-        labels,
-        dtype=torch.long,
-    )
-
-    expected = num_nodes * (num_nodes - 1)
-
-    if candidate_edge_index.shape != (2, expected):
-        raise RuntimeError(
-            "Candidate edge construction produced an invalid shape."
-        )
-
-    if candidate_edge_labels.shape != (expected,):
-        raise RuntimeError(
-            "Candidate edge labels have an invalid shape."
-        )
-
-    if candidate_edge_labels.sum() == 0:
+    if physical_edge_index.numel() == 0:
         raise ValueError(
             "No physical directed edges were found in the SimBench archive."
+        )
+
+    minimum = int(physical_edge_index.min().item())
+    maximum = int(physical_edge_index.max().item())
+    if minimum < 0 or maximum >= num_nodes:
+        raise ValueError(
+            "physical_edge_index contains an invalid node index: "
+            f"minimum={minimum}, maximum={maximum}, num_nodes={num_nodes}."
+        )
+
+    candidate_edge_index = physical_edge_index.contiguous().clone()
+    candidate_edge_labels = torch.ones(
+        candidate_edge_index.shape[1],
+        dtype=torch.long,
+    )
+
+    if (
+        candidate_edge_index.shape != physical_edge_index.shape
+        or not torch.equal(candidate_edge_index, physical_edge_index)
+    ):
+        raise AssertionError(
+            "AT-ODE candidate edge_index must equal physical_edge_index."
+        )
+
+    if candidate_edge_index.shape[1] != physical_edge_index.shape[1]:
+        raise AssertionError(
+            "Candidate-pair count must equal physical-edge count."
         )
 
     return candidate_edge_index, candidate_edge_labels
@@ -1864,8 +1839,6 @@ def run_experiment(
     if args.model in {"lgode", "atode"}:
         install_transport_factory_adapter(args)
 
-    # The transport implementation operates over complete non-self candidate
-    # pairs. Physical edges remain selected by candidate_edge_labels.
     model_edge_index = (
         candidate_edge_index
         if args.model in {"lgode", "atode"}

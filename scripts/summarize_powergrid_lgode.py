@@ -1893,7 +1893,7 @@ def build_paired_comparisons(
             row["std_mse_improvement_model_a"] = row[
                 "std_normalized_test_mse_improvement_model_a"
             ]
-            row["mean_relative_mse_improvement_percent"] = row[
+            row["mean_relative_normalized_test_mse_improvement_percent"] = row[
                 "mean_relative_normalized_test_mse_improvement_percent"
             ]
             row["std_relative_mse_improvement_percent"] = row[
@@ -2069,7 +2069,7 @@ def _print_report(
         print("\nAT-ODE transport improvement over LG-ODE:")
 
         for row in transport.itertuples(index=False):
-            value = row.mean_relative_mse_improvement_percent
+            value = row.mean_relative_normalized_test_mse_improvement_percent
             pairs = row.number_of_pairs
 
             if pd.isna(value):
