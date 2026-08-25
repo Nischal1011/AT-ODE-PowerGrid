@@ -127,13 +127,13 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-import lib.powergrid_model_factory as powergrid_factory
 from lib.powergrid_model_factory import (
     SUPPORTED_POWERGRID_MODELS,
     assert_lgode_atode_protocol_match,
     build_powergrid_lgode_model,
     count_total_parameters,
     count_trainable_parameters,
+    shared_graph_state_dict,
 )
 from lib.simbench_lgode_data import (
     NormalizationStats,
@@ -249,6 +249,89 @@ def sha256_file(path: Path) -> str:
             digest.update(chunk)
 
     return digest.hexdigest()
+
+
+def sha256_tensor(value: Tensor) -> str:
+    tensor = value.detach().cpu().contiguous()
+    digest = hashlib.sha256()
+    digest.update(str(tensor.dtype).encode("ascii"))
+    digest.update(str(tuple(tensor.shape)).encode("ascii"))
+    digest.update(tensor.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def sha256_state(values: Mapping[str, Tensor]) -> str:
+    digest = hashlib.sha256()
+    for name, value in sorted(values.items()):
+        digest.update(name.encode("utf-8"))
+        digest.update(sha256_tensor(value).encode("ascii"))
+    return digest.hexdigest()
+
+
+def dataset_protocol_manifest(
+    loaders: PowerGridDataLoaders,
+) -> Dict[str, Any]:
+    datasets = {
+        "train": loaders.train.dataset,
+        "validation": loaders.validation.dataset,
+        "test": loaders.test.dataset,
+    }
+    window_ids: Dict[str, Any] = {}
+    window_hashes: Dict[str, str] = {}
+    observation_mask_hashes: Dict[str, str] = {}
+
+    for split, dataset in datasets.items():
+        records = [asdict(record) for record in dataset.windows]
+        ids = [int(record["trajectory_id"]) for record in records]
+        window_ids[split] = ids
+        window_hashes[split] = hashlib.sha256(
+            json.dumps(
+                records,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+        mask_digest = hashlib.sha256()
+        for index, trajectory_id in enumerate(ids):
+            mask_digest.update(str(trajectory_id).encode("ascii"))
+            mask_digest.update(
+                sha256_tensor(dataset.observation_mask(index)).encode(
+                    "ascii"
+                )
+            )
+        observation_mask_hashes[split] = mask_digest.hexdigest()
+
+    return {
+        "window_counts": {
+            split: len(ids) for split, ids in window_ids.items()
+        },
+        "window_ids": window_ids,
+        "window_hashes": window_hashes,
+        "observation_mask_hashes": observation_mask_hashes,
+    }
+
+
+def enforce_protocol_fingerprint(
+    path: Optional[Path],
+    fingerprint: Mapping[str, Any],
+) -> None:
+    if path is None:
+        return
+
+    resolved = path.expanduser().resolve()
+    expected = to_json_compatible(fingerprint)
+    if resolved.exists():
+        with resolved.open("r", encoding="utf-8") as handle:
+            existing = json.load(handle)
+        if existing != expected:
+            raise RuntimeError(
+                "Protocol fingerprint differs from the first model for this "
+                f"controlled run: {resolved}"
+            )
+        return
+
+    atomic_write_json(fingerprint, resolved)
 
 
 # ---------------------------------------------------------------------------
@@ -388,229 +471,13 @@ def load_checkpoint(
 
 
 # ---------------------------------------------------------------------------
-# Compatibility adapter for the current repository
-# ---------------------------------------------------------------------------
-
-class RepositoryAttentionTransportAdapter(nn.Module):
-    """
-    Adapt SolverSafeAttentionTransport to the factory/solver interface.
-
-    The current repository has three interface differences:
-
-    1. The factory imports ``AttentionTransport``, but the implementation
-       exports ``SolverSafeAttentionTransport``.
-    2. DiffeqSolver passes rel_send and rel_rec to the transport forward call,
-       while SolverSafeAttentionTransport does not consume them.
-    3. DiffeqSolver expects a callable edge-weight provider, while
-       SolverSafeAttentionTransport returns an AttentionTransportCache whose
-       ``edge_weights_at`` method is the callable provider.
-
-    This adapter changes interfaces only. It does not modify transport
-    mathematics.
-    """
-
-    def __init__(
-        self,
-        *,
-        latent_dim: int,
-        edge_index: Tensor,
-        num_nodes: int,
-        num_bins: int,
-        max_age: float,
-        hidden_dim: int,
-        attention_dim: int,
-        num_heads: int,
-        initial_speed: float,
-        initial_decay: float,
-        dropout: float,
-    ) -> None:
-        super().__init__()
-
-        from lib.attention_transport import (
-            SolverSafeAttentionTransport,
-        )
-
-        self.transport = SolverSafeAttentionTransport(
-            latent_dim=int(latent_dim),
-            edge_index=edge_index,
-            num_nodes=int(num_nodes),
-            num_bins=int(num_bins),
-            max_age=float(max_age),
-            hidden_dim=int(hidden_dim),
-            attention_dim=int(attention_dim),
-            num_heads=int(num_heads),
-            initial_speed=float(initial_speed),
-            initial_decay=float(initial_decay),
-            learnable_speed=True,
-            learnable_decay=True,
-            dropout=float(dropout),
-        )
-
-    def forward(
-        self,
-        *,
-        z0: Tensor,
-        latest_observation_time: Tensor,
-        time_grid: Tensor,
-        physical_edge_mask: Optional[Tensor] = None,
-        rel_send: Optional[Tensor] = None,
-        rel_rec: Optional[Tensor] = None,
-        **_: Any,
-    ) -> Dict[str, Any]:
-        del rel_send, rel_rec
-
-        cache = self.transport(
-            z0=z0,
-            latest_observation_time=(
-                latest_observation_time.squeeze(-1)
-                if latest_observation_time.ndim == 3
-                and latest_observation_time.shape[-1] == 1
-                else latest_observation_time
-            ),
-            time_grid=time_grid,
-            physical_edge_mask=(
-                physical_edge_mask.squeeze(-1)
-                if physical_edge_mask is not None
-                and physical_edge_mask.ndim == 3
-                and physical_edge_mask.shape[-1] == 1
-                else physical_edge_mask
-            ),
-        )
-
-
-        return {
-            "provider": cache.edge_weights_at,
-            "diagnostics": cache.diagnostics,
-            "cache": cache,
-        }
-
-
-def install_transport_factory_adapter(
-    args: argparse.Namespace,
-) -> None:
-    """
-    Install a constructor compatible with powergrid_model_factory.py.
-
-    This can be removed after powergrid_model_factory directly imports and
-    correctly configures SolverSafeAttentionTransport.
-    """
-
-    def constructor(**keywords: Any) -> nn.Module:
-        latent_dim = int(
-            keywords.get(
-                "latent_dim",
-                keywords.get("state_dim", args.latent_dim),
-            )
-        )
-        edge_index = keywords.get("edge_index")
-
-        if edge_index is None:
-            raise ValueError(
-                "AT-ODE transport construction requires edge_index."
-            )
-
-        return RepositoryAttentionTransportAdapter(
-            latent_dim=latent_dim,
-            edge_index=torch.as_tensor(
-                edge_index,
-                dtype=torch.long,
-            ),
-            num_nodes=int(
-                keywords.get("num_nodes", args.num_nodes)
-            ),
-            num_bins=int(
-                keywords.get(
-                    "num_bins",
-                    keywords.get(
-                        "transport_bins",
-                        args.transport_bins,
-                    ),
-                )
-            ),
-            max_age=float(
-                keywords.get(
-                    "max_age",
-                    keywords.get(
-                        "transport_max_age",
-                        args.transport_max_age,
-                    ),
-                )
-            ),
-            hidden_dim=int(
-                keywords.get(
-                    "hidden_dim",
-                    keywords.get(
-                        "transport_hidden_dim",
-                        args.transport_hidden_dim,
-                    ),
-                )
-            ),
-            attention_dim=int(args.transport_attention_dim),
-            num_heads=int(args.transport_heads),
-            initial_speed=float(args.transport_speed),
-            initial_decay=float(args.transport_decay),
-            dropout=float(
-                keywords.get("dropout", args.dropout)
-            ),
-        )
-
-    powergrid_factory.AttentionTransport = constructor
-    powergrid_factory._ATTENTION_TRANSPORT_IMPORT_ERROR = None
-
-
-def canonicalize_graph_model_runtime(
-    model: nn.Module,
-    model_name: str,
-) -> None:
-    """
-    Convert the factory's legacy LG-ODE ``fixed`` label to ``ones``.
-
-    DiffeqSolver accepts ``fixed`` during construction as an alias, but the
-    factory subsequently overwrites the normalized value with ``fixed``.
-    The solver forward path requires the canonical value ``ones``.
-    """
-
-    if model_name != "lgode":
-        return
-
-    model.edge_weight_mode = "ones"
-
-    solver = getattr(model, "diffeq_solver", None)
-    if solver is None:
-        raise RuntimeError("LG-ODE model does not expose diffeq_solver.")
-
-    solver.edge_weight_mode = "ones"
-
-    ode_function = getattr(model, "generative_ode_function", None)
-    if ode_function is None:
-        ode_function = getattr(solver, "ode_func", None)
-
-    if ode_function is not None:
-        ode_function.edge_weight_mode = "ones"
-
-        ode_network = getattr(
-            ode_function,
-            "ode_func_net",
-            None,
-        )
-
-        if ode_network is not None and hasattr(ode_network, "gcs"):
-            for layer in ode_network.gcs:
-                convolution = getattr(layer, "base_conv", None)
-                if (
-                    convolution is not None
-                    and hasattr(convolution, "set_edge_weight_mode")
-                ):
-                    convolution.set_edge_weight_mode("ones")
-
-
-# ---------------------------------------------------------------------------
 # Physical candidate-edge graph
 # ---------------------------------------------------------------------------
 
 def build_candidate_graph(
     num_nodes: int,
     physical_edge_index: Tensor,
+    graph_mode: str = "physical_sparse",
 ) -> Tuple[Tensor, Tensor]:
     """
     Use the physical directed edges as the graph-model candidate pairs.
@@ -656,13 +523,45 @@ def build_candidate_graph(
             f"minimum={minimum}, maximum={maximum}, num_nodes={num_nodes}."
         )
 
-    candidate_edge_index = physical_edge_index.contiguous().clone()
-    candidate_edge_labels = torch.ones(
-        candidate_edge_index.shape[1],
-        dtype=torch.long,
-    )
+    if torch.any(physical_edge_index[0] == physical_edge_index[1]):
+        raise ValueError(
+            "physical_edge_index must not contain self-edges."
+        )
 
-    if (
+    if graph_mode == "physical_sparse":
+        candidate_edge_index = physical_edge_index.contiguous().clone()
+        candidate_edge_labels = torch.ones(
+            candidate_edge_index.shape[1],
+            dtype=torch.long,
+        )
+    elif graph_mode == "all_pairs_nri":
+        physical_pairs = {
+            (int(sender), int(receiver))
+            for sender, receiver in physical_edge_index.transpose(0, 1)
+            .tolist()
+        }
+        senders = []
+        receivers = []
+        labels = []
+        for receiver in range(num_nodes):
+            for sender in range(num_nodes):
+                if sender == receiver:
+                    continue
+                senders.append(sender)
+                receivers.append(receiver)
+                labels.append(
+                    int((sender, receiver) in physical_pairs)
+                )
+        candidate_edge_index = torch.tensor(
+            [senders, receivers], dtype=torch.long
+        )
+        candidate_edge_labels = torch.tensor(labels, dtype=torch.long)
+    else:
+        raise ValueError(
+            "graph_mode must be 'physical_sparse' or 'all_pairs_nri'."
+        )
+
+    if graph_mode == "physical_sparse" and (
         candidate_edge_index.shape != physical_edge_index.shape
         or not torch.equal(candidate_edge_index, physical_edge_index)
     ):
@@ -670,9 +569,24 @@ def build_candidate_graph(
             "AT-ODE candidate edge_index must equal physical_edge_index."
         )
 
-    if candidate_edge_index.shape[1] != physical_edge_index.shape[1]:
+    if (
+        graph_mode == "physical_sparse"
+        and candidate_edge_index.shape[1] != physical_edge_index.shape[1]
+    ):
         raise AssertionError(
             "Candidate-pair count must equal physical-edge count."
+        )
+
+    if candidate_edge_labels.numel() != candidate_edge_index.shape[1]:
+        raise AssertionError(
+            "candidate_labels must contain one entry per candidate edge."
+        )
+
+    if graph_mode == "physical_sparse" and not torch.all(
+        candidate_edge_labels == 1
+    ):
+        raise AssertionError(
+            "Every candidate label must represent an active physical line."
         )
 
     return candidate_edge_index, candidate_edge_labels
@@ -695,6 +609,8 @@ def batch_candidate_labels(
 
 def graph_decoder_dictionary(
     batch: PowerGridBatch,
+    *,
+    training: bool = False,
 ) -> Dict[str, Tensor]:
     """
     Convert [B,N,T,F] targets to the flattened original LG-ODE layout.
@@ -710,7 +626,9 @@ def graph_decoder_dictionary(
             num_times,
             input_dim,
         ),
-        "mask": batch.target_mask.reshape(
+        "mask": (
+            batch.training_loss_mask if training else batch.target_mask
+        ).reshape(
             batch_size * num_nodes,
             num_times,
             input_dim,
@@ -790,7 +708,7 @@ def compute_training_loss(
 
     return model.compute_all_losses(
         batch.encoder_graph,
-        graph_decoder_dictionary(batch),
+        graph_decoder_dictionary(batch, training=True),
         graph_labels,
         n_traj_samples=n_traj_samples,
         kl_coef=kl_coefficient,
@@ -898,6 +816,22 @@ class MetricAccumulator:
             dtype=torch.float64,
         )
 
+        self.horizon_squared_error: Optional[Tensor] = None
+        self.horizon_absolute_error: Optional[Tensor] = None
+        self.horizon_count: Optional[Tensor] = None
+        self.node_squared_error: Optional[Tensor] = None
+        self.node_absolute_error: Optional[Tensor] = None
+        self.node_count: Optional[Tensor] = None
+        self.feature_squared_error = torch.zeros(
+            feature_count, dtype=torch.float64
+        )
+        self.feature_absolute_error = torch.zeros(
+            feature_count, dtype=torch.float64
+        )
+        self.feature_count = torch.zeros(
+            feature_count, dtype=torch.float64
+        )
+
         self.number_of_windows = 0
         self.number_of_batches = 0
 
@@ -946,6 +880,33 @@ class MetricAccumulator:
         )
         self.normalized_count += float(mask_float.sum().item())
 
+        squared = normalized_error.square() * mask_float
+        absolute = normalized_error.abs() * mask_float
+        horizon_squared = squared.sum(dim=(0, 1, 3))
+        horizon_absolute = absolute.sum(dim=(0, 1, 3))
+        horizon_count = mask_float.sum(dim=(0, 1, 3))
+        node_squared = squared.sum(dim=(0, 2, 3))
+        node_absolute = absolute.sum(dim=(0, 2, 3))
+        node_count = mask_float.sum(dim=(0, 2, 3))
+
+        if self.horizon_squared_error is None:
+            self.horizon_squared_error = torch.zeros_like(horizon_squared)
+            self.horizon_absolute_error = torch.zeros_like(horizon_absolute)
+            self.horizon_count = torch.zeros_like(horizon_count)
+            self.node_squared_error = torch.zeros_like(node_squared)
+            self.node_absolute_error = torch.zeros_like(node_absolute)
+            self.node_count = torch.zeros_like(node_count)
+
+        self.horizon_squared_error += horizon_squared
+        self.horizon_absolute_error += horizon_absolute
+        self.horizon_count += horizon_count
+        self.node_squared_error += node_squared
+        self.node_absolute_error += node_absolute
+        self.node_count += node_count
+        self.feature_squared_error += squared.sum(dim=(0, 1, 2))
+        self.feature_absolute_error += absolute.sum(dim=(0, 1, 2))
+        self.feature_count += mask_float.sum(dim=(0, 1, 2))
+
         standard_deviation = self.std.reshape(1, 1, 1, -1)
         physical_error = normalized_error * standard_deviation
 
@@ -979,6 +940,41 @@ class MetricAccumulator:
             / self.normalized_count
         )
 
+        if self.horizon_count is None or self.node_count is None:
+            raise RuntimeError("No structured target metrics were accumulated.")
+
+        horizon_denominator = self.horizon_count.clamp_min(1.0)
+        node_denominator = self.node_count.clamp_min(1.0)
+        normalized_feature_denominator = self.feature_count.clamp_min(1.0)
+        per_horizon = {
+            "mse": (
+                self.horizon_squared_error / horizon_denominator
+            ).tolist(),
+            "mae": (
+                self.horizon_absolute_error / horizon_denominator
+            ).tolist(),
+            "count": self.horizon_count.long().tolist(),
+        }
+        per_node = {
+            "mse": (self.node_squared_error / node_denominator).tolist(),
+            "mae": (self.node_absolute_error / node_denominator).tolist(),
+            "count": self.node_count.long().tolist(),
+        }
+        normalized_per_feature = {
+            self.feature_names[index]: {
+                "mse": float(
+                    self.feature_squared_error[index]
+                    / normalized_feature_denominator[index]
+                ),
+                "mae": float(
+                    self.feature_absolute_error[index]
+                    / normalized_feature_denominator[index]
+                ),
+                "count": int(self.feature_count[index].item()),
+            }
+            for index in range(len(self.feature_names))
+        }
+
         feature_denominator = self.physical_count.clamp_min(1.0)
         feature_mse = (
             self.physical_squared_error / feature_denominator
@@ -1006,6 +1002,9 @@ class MetricAccumulator:
             "normalized_mse": float(normalized_mse),
             "normalized_mae": float(normalized_mae),
             "physical_per_feature": per_feature,
+            "normalized_per_horizon": per_horizon,
+            "normalized_per_node": per_node,
+            "normalized_per_feature": normalized_per_feature,
             "number_of_windows": self.number_of_windows,
             "number_of_batches": self.number_of_batches,
             "number_of_target_elements": int(
@@ -1027,6 +1026,7 @@ def evaluate(
     task: str,
     n_traj_samples: int,
     evaluation_seed: int,
+    max_batches: Optional[int] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
     Evaluate a split without changing model parameters.
@@ -1064,7 +1064,9 @@ def evaluate(
         if cuda_devices:
             torch.cuda.manual_seed_all(int(evaluation_seed))
 
-        for batch in loader:
+        for batch_index, batch in enumerate(loader):
+            if max_batches is not None and batch_index >= max_batches:
+                break
             batch = batch.to(
                 device,
                 non_blocking=device.type == "cuda",
@@ -1094,21 +1096,30 @@ def evaluate(
             )
 
             if task == "interpolation":
-                expected_observed_shape = batch.target_values.shape[:3]
-                if tuple(batch.observed_event_mask.shape) != tuple(
-                    expected_observed_shape
+                expected_mask_shape = batch.target_values.shape
+                if tuple(batch.interpolation_withheld_mask.shape) != tuple(
+                    expected_mask_shape
                 ):
                     raise ValueError(
-                        "Interpolation observed_event_mask must have shape "
-                        f"[B,N,T]={tuple(expected_observed_shape)}; got "
-                        f"{tuple(batch.observed_event_mask.shape)}."
+                        "interpolation_withheld_mask must match targets; "
+                        f"expected {tuple(expected_mask_shape)}, got "
+                        f"{tuple(batch.interpolation_withheld_mask.shape)}."
                     )
-                unobserved_mask = (
-                    ~batch.observed_event_mask.to(dtype=torch.bool)
+                observed_target_mask = batch.observed_event_mask.to(
+                    dtype=torch.bool
                 ).unsqueeze(-1).expand_as(batch.target_values)
-                unobserved_mask = unobserved_mask & batch.target_mask.bool()
+                unobserved_mask = batch.interpolation_withheld_mask.bool()
+                if torch.any(unobserved_mask & observed_target_mask):
+                    raise AssertionError(
+                        "Interpolation unobserved targets overlap observed "
+                        "encoder events."
+                    )
+                if not torch.any(unobserved_mask):
+                    raise ValueError(
+                        "Interpolation contains no unobserved target entries."
+                    )
             else:
-                unobserved_mask = batch.target_mask.bool()
+                unobserved_mask = batch.extrapolation_future_mask.bool()
 
             unobserved_accumulator.update(
                 mean_prediction,
@@ -1131,6 +1142,30 @@ def evaluate(
             ],
             "normalized_mae_unobserved": unobserved_metrics[
                 "normalized_mae"
+            ],
+            "normalized_per_horizon_full": full_metrics[
+                "normalized_per_horizon"
+            ],
+            "normalized_per_node_full": full_metrics[
+                "normalized_per_node"
+            ],
+            "normalized_per_feature_full": full_metrics[
+                "normalized_per_feature"
+            ],
+            "normalized_per_horizon_unobserved": unobserved_metrics[
+                "normalized_per_horizon"
+            ],
+            "normalized_per_node_unobserved": unobserved_metrics[
+                "normalized_per_node"
+            ],
+            "normalized_per_feature_unobserved": unobserved_metrics[
+                "normalized_per_feature"
+            ],
+            "physical_per_feature_full": full_metrics[
+                "physical_per_feature"
+            ],
+            "physical_per_feature_unobserved": unobserved_metrics[
+                "physical_per_feature"
             ],
         }
     )
@@ -1168,6 +1203,7 @@ def train_one_epoch(
     n_traj_samples: int,
     kl_coef: float,
     gradient_clip: float,
+    max_batches: Optional[int] = None,
 ) -> Dict[str, float]:
     model.train()
 
@@ -1175,8 +1211,12 @@ def train_one_epoch(
     total_batches = 0
     total_mse = 0.0
     total_kl = 0.0
+    total_likelihood = 0.0
+    total_gradient_norm = 0.0
 
-    for batch in loader:
+    for batch_index, batch in enumerate(loader):
+        if max_batches is not None and batch_index >= max_batches:
+            break
         batch = batch.to(
             device,
             non_blocking=device.type == "cuda",
@@ -1219,10 +1259,15 @@ def train_one_epoch(
                     f"{parameter_name!r}."
                 )
 
-        if gradient_clip > 0.0:
-            nn.utils.clip_grad_norm_(
-                model.parameters(),
-                max_norm=gradient_clip,
+        gradient_norm = nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_norm=(
+                gradient_clip if gradient_clip > 0.0 else float("inf")
+            ),
+        )
+        if not torch.isfinite(gradient_norm):
+            raise FloatingPointError(
+                "Non-finite aggregate gradient norm."
             )
 
         optimizer.step()
@@ -1232,6 +1277,10 @@ def train_one_epoch(
         total_kl += float(
             losses.get("kl_first_p", float("nan"))
         )
+        total_likelihood += float(
+            losses.get("likelihood", float("nan"))
+        )
+        total_gradient_norm += float(gradient_norm.detach().cpu().item())
         total_batches += 1
 
     if total_batches == 0:
@@ -1241,6 +1290,8 @@ def train_one_epoch(
         "loss": total_loss / total_batches,
         "model_mse_diagnostic": total_mse / total_batches,
         "kl_first_p": total_kl / total_batches,
+        "reconstruction_likelihood": total_likelihood / total_batches,
+        "gradient_norm_pre_clip": total_gradient_norm / total_batches,
         "kl_coefficient": float(kl_coef),
         "number_of_batches": total_batches,
     }
@@ -1444,6 +1495,11 @@ def parse_args(
         default=0.0,
     )
     parser.add_argument(
+        "--optimizer",
+        choices=("adam", "adamw"),
+        default="adam",
+    )
+    parser.add_argument(
         "--gradient-clip",
         type=float,
         default=10.0,
@@ -1546,9 +1602,19 @@ def parse_args(
         default=2,
     )
     parser.add_argument(
+        "--graph-mode",
+        choices=("physical_sparse", "all_pairs_nri"),
+        default="physical_sparse",
+    )
+    parser.add_argument(
         "--dropout",
         type=float,
         default=0.2,
+    )
+    parser.add_argument(
+        "--ode-dropout",
+        type=float,
+        default=0.0,
     )
     parser.add_argument(
         "--observation-std",
@@ -1648,6 +1714,18 @@ def parse_args(
         action="store_true",
     )
     parser.add_argument(
+        "--max-train-batches",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--max-eval-batches",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="auto",
@@ -1663,6 +1741,11 @@ def parse_args(
         "--checkpoint-dir",
         type=Path,
         default=DEFAULT_CHECKPOINT_DIRECTORY,
+    )
+    parser.add_argument(
+        "--protocol-fingerprint-path",
+        type=Path,
+        default=None,
     )
     parser.add_argument(
         "--run-name",
@@ -1723,6 +1806,13 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.stride < 1:
         raise ValueError("--stride must be positive.")
 
+    for field in ("max_train_batches", "max_eval_batches"):
+        value = getattr(args, field)
+        if value is not None and value < 1:
+            raise ValueError(
+                f"--{field.replace('_', '-')} must be positive when set."
+            )
+
     if args.lr <= 0.0:
         raise ValueError("--lr must be positive.")
 
@@ -1740,6 +1830,9 @@ def validate_args(args: argparse.Namespace) -> None:
 
     if not 0.0 <= args.dropout < 1.0:
         raise ValueError("--dropout must be in [0,1).")
+
+    if args.ode_dropout != 0.0:
+        raise ValueError("--ode-dropout must be exactly zero.")
 
     if args.observation_std <= 0.0:
         raise ValueError("--observation-std must be positive.")
@@ -1769,6 +1862,7 @@ def validate_args(args: argparse.Namespace) -> None:
 def run_experiment(
     args: argparse.Namespace,
 ) -> Dict[str, Any]:
+    experiment_start = time.perf_counter()
     seed_everything(
         args.seed,
         deterministic=args.deterministic,
@@ -1833,11 +1927,33 @@ def run_experiment(
         build_candidate_graph(
             archive.num_nodes,
             archive.edge_index,
+            args.graph_mode,
         )
     )
 
-    if args.model in {"lgode", "atode"}:
-        install_transport_factory_adapter(args)
+    data_sha256 = sha256_file(resolved_data_path)
+    protocol_manifest = dataset_protocol_manifest(loaders)
+    edge_index_hash = sha256_tensor(candidate_edge_index)
+    protocol_fingerprint = {
+        "data_sha256": data_sha256,
+        "task": args.task,
+        "observed_fraction": args.observed_fraction,
+        "trajectory_length": args.trajectory_length,
+        "context_length": args.context_length,
+        "forecast_length": args.forecast_length,
+        "stride": args.stride,
+        "seed": args.seed,
+        "mask_seed": args.mask_seed,
+        "graph_mode": args.graph_mode,
+        "train_end": archive.train_end,
+        "validation_end": archive.validation_end,
+        "edge_index_hash": edge_index_hash,
+        **protocol_manifest,
+    }
+    enforce_protocol_fingerprint(
+        args.protocol_fingerprint_path,
+        protocol_fingerprint,
+    )
 
     model_edge_index = (
         candidate_edge_index
@@ -1854,6 +1970,24 @@ def run_experiment(
         device=device,
     )
 
+    shared_initialization_hash = None
+
+    if args.model in {"lgode", "atode"}:
+        model_edges = getattr(model, "powergrid_edge_index", None)
+        if not isinstance(model_edges, Tensor) or not torch.equal(
+            model_edges.cpu(), candidate_edge_index.cpu()
+        ):
+            raise AssertionError(
+                "Graph model edge order differs from physical_edge_index."
+            )
+        model_edge_count = int(
+            model.diffeq_solver.candidate_edge_count
+        )
+        if model_edge_count != candidate_edge_index.shape[1]:
+            raise AssertionError(
+                "Graph model edge count differs from physical-edge count."
+            )
+
     if args.model in {"lgode", "atode"}:
         counterpart_name = "atode" if args.model == "lgode" else "lgode"
         counterpart = build_powergrid_lgode_model(
@@ -1866,14 +2000,22 @@ def run_experiment(
         )
         if args.model == "lgode":
             assert_lgode_atode_protocol_match(model, counterpart)
+            model_shared_state = shared_graph_state_dict(model)
+            counterpart_shared_state = shared_graph_state_dict(counterpart)
         else:
             assert_lgode_atode_protocol_match(counterpart, model)
+            model_shared_state = shared_graph_state_dict(model)
+            counterpart_shared_state = shared_graph_state_dict(counterpart)
+        model_initialization_hash = sha256_state(model_shared_state)
+        counterpart_initialization_hash = sha256_state(
+            counterpart_shared_state
+        )
+        if model_initialization_hash != counterpart_initialization_hash:
+            raise AssertionError(
+                "LG-ODE and AT-ODE shared initialization hashes differ."
+            )
+        shared_initialization_hash = model_initialization_hash
         del counterpart
-
-    canonicalize_graph_model_runtime(
-        model,
-        args.model,
-    )
 
     total_parameters = count_total_parameters(model)
     trainable_parameters = count_trainable_parameters(model)
@@ -1945,6 +2087,7 @@ def run_experiment(
             task=args.task,
             n_traj_samples=1,
             evaluation_seed=args.eval_seed,
+            max_batches=args.max_eval_batches,
         )
 
         checkpoint_metric = (
@@ -1957,7 +2100,12 @@ def run_experiment(
         training_time_seconds = 0.0
 
     else:
-        optimizer = torch.optim.Adam(
+        optimizer_class = (
+            torch.optim.AdamW
+            if args.optimizer == "adamw"
+            else torch.optim.Adam
+        )
+        optimizer = optimizer_class(
             model.parameters(),
             lr=args.lr,
             weight_decay=args.weight_decay,
@@ -1992,6 +2140,7 @@ def run_experiment(
                 n_traj_samples=args.train_samples,
                 kl_coef=current_kl_coefficient,
                 gradient_clip=args.gradient_clip,
+                max_batches=args.max_train_batches,
             )
 
             validation_metrics, validation_diagnostics = evaluate(
@@ -2005,6 +2154,7 @@ def run_experiment(
                 task=args.task,
                 n_traj_samples=args.eval_samples,
                 evaluation_seed=args.eval_seed,
+                max_batches=args.max_eval_batches,
             )
 
             checkpoint_metric = (
@@ -2114,6 +2264,7 @@ def run_experiment(
             task=args.task,
             n_traj_samples=args.eval_samples,
             evaluation_seed=args.eval_seed,
+            max_batches=args.max_eval_batches,
         )
 
     # This is the only test-set evaluation in the entire script.
@@ -2133,9 +2284,11 @@ def run_experiment(
             else args.eval_samples
         ),
         evaluation_seed=args.eval_seed,
+        max_batches=args.max_eval_batches,
     )
 
     test_time_seconds = time.perf_counter() - test_start
+    total_runtime_seconds = time.perf_counter() - experiment_start
 
     normalizer = {
         "mean": loaders.normalization.mean.tolist(),
@@ -2152,16 +2305,27 @@ def run_experiment(
         "alias": args.alias,
         "model": args.model,
         "model_name": args.model,
+        "architecture_name": (
+            "IndependentGRULatentODE"
+            if args.model == "latentode"
+            else args.model
+        ),
         "task": args.task,
         "observed_fraction": args.observed_fraction,
         "seed": args.seed,
         "mask_seed": args.mask_seed,
         "eval_seed": args.eval_seed,
+        "evaluation_mode": (
+            "posterior_mean"
+            if args.model != "persistence"
+            else "deterministic"
+        ),
+        "eval_samples": args.eval_samples,
         "simbench_code": simbench_code,
         "git_commit": git_commit(),
         "dataset": {
             "path": str(resolved_data_path),
-            "sha256": sha256_file(resolved_data_path),
+            "sha256": data_sha256,
             "simbench_code": simbench_code,
             "num_timesteps": archive.num_timesteps,
             "num_nodes": archive.num_nodes,
@@ -2178,6 +2342,9 @@ def run_experiment(
             ),
             "train_end": archive.train_end,
             "validation_end": archive.validation_end,
+            "test_end": archive.num_timesteps,
+            "edge_index_sha256": edge_index_hash,
+            **protocol_manifest,
             "metadata": archive.metadata,
             "normalization": normalizer,
         },
@@ -2207,8 +2374,11 @@ def run_experiment(
         "trainable_parameter_count": trainable_parameters,
         "best_validation_epoch": best_validation_epoch,
         "best_validation_mse": best_validation_mse,
+        "checkpoint_selection_metric": checkpoint_metric,
+        "shared_initialization_sha256": shared_initialization_hash,
         "training_time_seconds": training_time_seconds,
         "test_time_seconds": test_time_seconds,
+        "runtime_seconds": total_runtime_seconds,
         "validation": validation_metrics,
         "test": test_metrics,
         "diagnostics": {
@@ -2235,15 +2405,34 @@ def run_experiment(
             "selected_using": f"validation.{checkpoint_metric}",
             "test_used_for_selection": False,
         },
+        "optimizer": {
+            "name": (
+                args.optimizer.upper()
+                if args.model != "persistence"
+                else None
+            ),
+            "learning_rate": args.lr,
+            "weight_decay": args.weight_decay,
+            "gradient_clip": args.gradient_clip,
+            "lr_patience": args.lr_patience,
+            "lr_factor": args.lr_factor,
+        },
         "protocol": {
             "normalization_training_only": True,
             "complete_target_evaluation": True,
             "validation_checkpoint_selection": True,
+            "primary_metric": checkpoint_metric,
             "test_evaluations": 1,
             "observation_masks_model_independent": True,
             "missing_observations_imputed_into_encoder": False,
             "lgode_atode_difference": (
                 "time-dependent edge transport only"
+            ),
+            "graph_mode": args.graph_mode,
+            "interpolation_semantics": (
+                "noncausal_smoothing_over_observations_across_window"
+                if args.task == "interpolation"
+                else None
             ),
         },
     }

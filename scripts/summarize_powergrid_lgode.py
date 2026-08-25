@@ -660,6 +660,21 @@ def _parse_result_json(
         required=False,
     )
 
+    if task == "interpolation":
+        if not math.isfinite(normalized_test_mse_unobserved):
+            raise ValueError(
+                f"Interpolation result lacks withheld test MSE: {path}"
+            )
+        if not math.isfinite(normalized_test_mae_unobserved):
+            raise ValueError(
+                f"Interpolation result lacks withheld test MAE: {path}"
+            )
+        normalized_test_mse = normalized_test_mse_unobserved
+        normalized_test_mae = normalized_test_mae_unobserved
+    else:
+        normalized_test_mse = normalized_test_mse_full
+        normalized_test_mae = normalized_test_mae_full
+
     # ------------------------------------------------------------------
     # Physical-unit feature metrics
     # ------------------------------------------------------------------
@@ -2254,4 +2269,3 @@ if __name__ == "__main__":
             file=sys.stderr,
         )
         raise SystemExit(1)
-s

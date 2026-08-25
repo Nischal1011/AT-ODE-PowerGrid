@@ -143,6 +143,10 @@ _BATCH_KEYS = (
     "target_times",
     "target_mask",
     "observed_event_mask",
+    "encoder_observation_mask",
+    "training_loss_mask",
+    "interpolation_withheld_mask",
+    "extrapolation_future_mask",
     "trajectory_id",
 )
 
@@ -230,6 +234,10 @@ class PowerGridBatch(Mapping[str, Any]):
     target_times: Tensor
     target_mask: Tensor
     observed_event_mask: Tensor
+    encoder_observation_mask: Tensor
+    training_loss_mask: Tensor
+    interpolation_withheld_mask: Tensor
+    extrapolation_future_mask: Tensor
     trajectory_id: Tensor
 
     def __getitem__(self, key: str) -> Any:
@@ -263,6 +271,20 @@ class PowerGridBatch(Mapping[str, Any]):
             observed_event_mask=self.observed_event_mask.to(
                 device, non_blocking=non_blocking
             ),
+            encoder_observation_mask=self.encoder_observation_mask.to(
+                device, non_blocking=non_blocking
+            ),
+            training_loss_mask=self.training_loss_mask.to(
+                device, non_blocking=non_blocking
+            ),
+            interpolation_withheld_mask=(
+                self.interpolation_withheld_mask.to(
+                    device, non_blocking=non_blocking
+                )
+            ),
+            extrapolation_future_mask=self.extrapolation_future_mask.to(
+                device, non_blocking=non_blocking
+            ),
             trajectory_id=self.trajectory_id.to(
                 device, non_blocking=non_blocking
             ),
@@ -288,6 +310,16 @@ class PowerGridBatch(Mapping[str, Any]):
             target_times=self.target_times.pin_memory(),
             target_mask=self.target_mask.pin_memory(),
             observed_event_mask=self.observed_event_mask.pin_memory(),
+            encoder_observation_mask=(
+                self.encoder_observation_mask.pin_memory()
+            ),
+            training_loss_mask=self.training_loss_mask.pin_memory(),
+            interpolation_withheld_mask=(
+                self.interpolation_withheld_mask.pin_memory()
+            ),
+            extrapolation_future_mask=(
+                self.extrapolation_future_mask.pin_memory()
+            ),
             trajectory_id=self.trajectory_id.pin_memory(),
         )
 
@@ -532,6 +564,26 @@ def load_simbench_npz(
                 "edge_index contains an invalid bus index: "
                 f"min={minimum_node}, max={maximum_node}, "
                 f"num_buses={num_buses}"
+            )
+
+        edge_pairs = [
+            (int(edge_index_np[0, index]), int(edge_index_np[1, index]))
+            for index in range(num_edges)
+        ]
+        if any(sender == receiver for sender, receiver in edge_pairs):
+            raise ValueError("edge_index must not contain self-edges")
+        if len(set(edge_pairs)) != len(edge_pairs):
+            raise ValueError("edge_index contains duplicate directed edges")
+        pair_set = set(edge_pairs)
+        missing_reverse = [
+            (sender, receiver)
+            for sender, receiver in edge_pairs
+            if (receiver, sender) not in pair_set
+        ]
+        if missing_reverse:
+            raise ValueError(
+                "The power-grid graph must contain both directions for every "
+                f"physical connection; missing reverse for {missing_reverse[0]}."
             )
 
     if np.unique(bus_indices_np).shape[0] != num_buses:
@@ -1194,6 +1246,16 @@ class SimBenchLGODEDataset(Dataset):
         target_mask = torch.ones_like(
             target_values, dtype=torch.bool
         )
+        if self.task == "interpolation":
+            interpolation_withheld_mask = (
+                ~observed_event_mask
+            ).unsqueeze(-1).expand_as(target_values).clone()
+            extrapolation_future_mask = torch.zeros_like(target_mask)
+            training_loss_mask = interpolation_withheld_mask
+        else:
+            interpolation_withheld_mask = torch.zeros_like(target_mask)
+            extrapolation_future_mask = target_mask.clone()
+            training_loss_mask = extrapolation_future_mask
 
         # Metadata useful for protocol checks and diagnostics. Required fields
         # remain exactly the standard LG-ODE fields listed in the module docs.
@@ -1217,6 +1279,10 @@ class SimBenchLGODEDataset(Dataset):
             "target_times": target_times,
             "target_mask": target_mask,
             "observed_event_mask": observed_event_mask,
+            "encoder_observation_mask": observed_event_mask,
+            "training_loss_mask": training_loss_mask,
+            "interpolation_withheld_mask": interpolation_withheld_mask,
+            "extrapolation_future_mask": extrapolation_future_mask,
             "trajectory_id": torch.tensor(
                 record.trajectory_id, dtype=torch.long
             ),
@@ -1254,6 +1320,22 @@ def collate_powergrid_lgode(
         [sample["observed_event_mask"] for sample in samples],
         dim=0,
     )
+    encoder_observation_mask = torch.stack(
+        [sample["encoder_observation_mask"] for sample in samples],
+        dim=0,
+    )
+    training_loss_mask = torch.stack(
+        [sample["training_loss_mask"] for sample in samples],
+        dim=0,
+    )
+    interpolation_withheld_mask = torch.stack(
+        [sample["interpolation_withheld_mask"] for sample in samples],
+        dim=0,
+    )
+    extrapolation_future_mask = torch.stack(
+        [sample["extrapolation_future_mask"] for sample in samples],
+        dim=0,
+    )
     trajectory_id = torch.stack(
         [sample["trajectory_id"] for sample in samples],
         dim=0,
@@ -1266,6 +1348,10 @@ def collate_powergrid_lgode(
         target_times=target_times,
         target_mask=target_mask,
         observed_event_mask=observed_event_mask,
+        encoder_observation_mask=encoder_observation_mask,
+        training_loss_mask=training_loss_mask,
+        interpolation_withheld_mask=interpolation_withheld_mask,
+        extrapolation_future_mask=extrapolation_future_mask,
         trajectory_id=trajectory_id,
     )
 

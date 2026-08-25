@@ -878,29 +878,30 @@ class NRIConv(nn.Module):
             inputs,
             physical_edge_mask,
         )
-        normalized_weight = (
-            self._normalize_physical_incoming_weights(
+        if self.edge_weight_mode == "transport":
+            effective_weight = raw_weight
+        else:
+            effective_weight = self._normalize_physical_incoming_weights(
                 raw_weight,
                 physical_edge_mask,
                 rel_rec,
             )
-        )
 
-        if not torch.isfinite(normalized_weight).all():
+        if not torch.isfinite(effective_weight).all():
             raise RuntimeError(
-                "Normalized edge weights contain NaN or infinity"
+                "Effective edge weights contain NaN or infinity"
             )
-        if torch.any(normalized_weight < 0):
+        if torch.any(effective_weight < 0):
             raise RuntimeError(
-                "Normalized edge weights contain negative values"
+                "Effective edge weights contain negative values"
             )
 
         # Runtime diagnostic fields. These do not participate in transport
         # evolution and are replaced rather than accumulated on every call.
         self.physical_edge_mask = physical_edge_mask
-        self.last_effective_edge_weight = normalized_weight
+        self.last_effective_edge_weight = effective_weight
 
-        return physical_edge_mask, normalized_weight
+        return physical_edge_mask, effective_weight
 
     def forward(self, inputs, pred_steps=1):
         """

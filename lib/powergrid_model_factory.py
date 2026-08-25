@@ -54,13 +54,7 @@ from lib.powergrid_baselines import (
     PersistenceBaseline,
 )
 
-try:
-    from lib.attention_transport import AttentionTransport
-except ImportError as exc:  # pragma: no cover
-    _ATTENTION_TRANSPORT_IMPORT_ERROR = exc
-    AttentionTransport = None  # type: ignore[assignment,misc]
-else:
-    _ATTENTION_TRANSPORT_IMPORT_ERROR = None
+from lib.attention_transport import SolverSafeAttentionTransport
 
 
 SUPPORTED_POWERGRID_MODELS = (
@@ -99,6 +93,7 @@ class PowerGridModelConfig:
     rtol: float
     atol: float
     dropout: float
+    ode_dropout: float
 
     observation_std: float
     seed: int
@@ -106,6 +101,8 @@ class PowerGridModelConfig:
     transport_bins: int
     transport_max_age: float
     transport_hidden_dim: int
+    transport_attention_dim: int
+    transport_heads: int
     transport_speed: float
     transport_decay: float
 
@@ -134,6 +131,7 @@ class PowerGridModelConfig:
             "rtol": self.rtol,
             "atol": self.atol,
             "dropout": self.dropout,
+            "ode_dropout": self.ode_dropout,
             "observation_std": self.observation_std,
         }
 
@@ -362,6 +360,14 @@ def _resolve_config(
         )
     )
 
+    ode_dropout = float(
+        _read_argument(
+            args,
+            "ode_dropout",
+            default=0.0,
+        )
+    )
+
     observation_std = float(
         _read_argument(
             args,
@@ -401,6 +407,22 @@ def _resolve_config(
             args,
             "transport_hidden_dim",
             default=64,
+        )
+    )
+
+    transport_attention_dim = int(
+        _read_argument(
+            args,
+            "transport_attention_dim",
+            default=16,
+        )
+    )
+
+    transport_heads = int(
+        _read_argument(
+            args,
+            "transport_heads",
+            default=4,
         )
     )
 
@@ -453,6 +475,9 @@ def _resolve_config(
     if not 0.0 <= dropout < 1.0:
         raise ValueError("dropout must be in [0, 1)")
 
+    if ode_dropout != 0.0:
+        raise ValueError("ode_dropout must be exactly zero")
+
     if rtol <= 0.0:
         raise ValueError("rtol must be positive")
 
@@ -470,6 +495,12 @@ def _resolve_config(
 
     if transport_hidden_dim < 1:
         raise ValueError("transport_hidden_dim must be positive")
+
+    if transport_attention_dim < 1:
+        raise ValueError("transport_attention_dim must be positive")
+
+    if transport_heads < 1:
+        raise ValueError("transport_heads must be positive")
 
     if transport_speed <= 0.0:
         raise ValueError("transport_speed must be positive")
@@ -509,11 +540,14 @@ def _resolve_config(
         rtol=rtol,
         atol=atol,
         dropout=dropout,
+        ode_dropout=ode_dropout,
         observation_std=observation_std,
         seed=seed,
         transport_bins=transport_bins,
         transport_max_age=transport_max_age,
         transport_hidden_dim=transport_hidden_dim,
+        transport_attention_dim=transport_attention_dim,
+        transport_heads=transport_heads,
         transport_speed=transport_speed,
         transport_decay=transport_decay,
     )
@@ -557,6 +591,9 @@ def _validate_edge_index(
                 f"minimum={minimum}, maximum={maximum}, "
                 f"num_nodes={num_nodes}"
             )
+
+        if torch.any(edge_index[0] == edge_index[1]):
+            raise ValueError("edge_index must not contain self-edges")
 
     return edge_index.contiguous()
 
@@ -603,6 +640,7 @@ def _solver_args_namespace(
         "odenet": config.ode_type,
         "rec_attention": config.recognition_aggregation,
         "dropout": config.dropout,
+        "ode_dropout": config.ode_dropout,
         "solver": config.solver,
         "task": config.task,
     }
@@ -719,7 +757,7 @@ def _make_graph_ode_network(
         out_dim=config.ode_state_dim,
         n_heads=config.attention_heads,
         n_layers=config.ode_layers,
-        dropout=0.0,
+        dropout=config.ode_dropout,
         conv_name=config.ode_type,
         aggregate="add",
     )
@@ -784,34 +822,20 @@ def _make_transport_provider(
     has been initialized.
     """
 
-    if AttentionTransport is None:
-        raise ImportError(
-            "AT-ODE requires lib.attention_transport.AttentionTransport"
-        ) from _ATTENTION_TRANSPORT_IMPORT_ERROR
-
-    keywords = {
-        "num_nodes": config.num_nodes,
-        "edge_index": edge_index,
-        "latent_dim": config.ode_state_dim,
-        "state_dim": config.ode_state_dim,
-        "input_dim": config.input_dim,
-        "hidden_dim": config.transport_hidden_dim,
-        "transport_hidden_dim": config.transport_hidden_dim,
-        "num_bins": config.transport_bins,
-        "transport_bins": config.transport_bins,
-        "max_age": config.transport_max_age,
-        "transport_max_age": config.transport_max_age,
-        "speed": config.transport_speed,
-        "transport_speed": config.transport_speed,
-        "decay": config.transport_decay,
-        "transport_decay": config.transport_decay,
-        "dropout": config.dropout,
-    }
-
-    provider = _construct_with_supported_keywords(
-        AttentionTransport,
-        positional=(),
-        keywords=keywords,
+    provider = SolverSafeAttentionTransport(
+        latent_dim=config.ode_state_dim,
+        edge_index=edge_index,
+        num_nodes=config.num_nodes,
+        num_bins=config.transport_bins,
+        max_age=config.transport_max_age,
+        hidden_dim=config.transport_hidden_dim,
+        attention_dim=config.transport_attention_dim,
+        num_heads=config.transport_heads,
+        initial_speed=config.transport_speed,
+        initial_decay=config.transport_decay,
+        learnable_speed=True,
+        learnable_decay=True,
+        dropout=config.dropout,
     )
 
     if not isinstance(provider, nn.Module):
@@ -905,11 +929,7 @@ def _verify_solver_protocol(
             "_verify_solver_protocol supports only lgode and atode"
         )
 
-    expected_mode = (
-        "fixed"
-        if model_name == "lgode"
-        else "transport"
-    )
+    expected_mode = "ones" if model_name == "lgode" else "transport"
 
     actual_model_type = getattr(solver, "model_type", model_name)
     if actual_model_type != model_name:
@@ -1025,9 +1045,7 @@ def _build_graph_latent_ode(
     )
 
     edge_weight_mode = (
-        "fixed"
-        if config.model_name == "lgode"
-        else "transport"
+        "ones" if config.model_name == "lgode" else "transport"
     )
 
     # ------------------------------------------------------------------
@@ -1406,9 +1424,9 @@ def assert_lgode_atode_protocol_match(
             "AT-ODE model_type must be 'atode'"
         )
 
-    if getattr(lgode, "edge_weight_mode", None) != "fixed":
+    if getattr(lgode, "edge_weight_mode", None) != "ones":
         raise AssertionError(
-            "LG-ODE must use fixed edge weights"
+            "LG-ODE must use unit edge weights"
         )
 
     if getattr(atode, "edge_weight_mode", None) != "transport":

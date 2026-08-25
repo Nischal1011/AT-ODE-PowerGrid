@@ -444,7 +444,7 @@ class PersistenceBaseline(nn.Module):
         """
 
         prediction = self.predict(batch)
-        mask = batch.target_mask.to(dtype=torch.bool)
+        mask = batch.training_loss_mask.to(dtype=torch.bool)
 
         squared_error = (prediction - batch.target_values).square()
         absolute_error = (prediction - batch.target_values).abs()
@@ -623,7 +623,14 @@ class IndependentSparseEncoder(nn.Module):
             batch_first=True,
             enforce_sorted=False,
         )
-        _, final_hidden = self.gru(packed)
+        # Deterministic multi-layer cuDNN GRU teardown exits 127 on the
+        # supported Windows CUDA stack. The native PyTorch CUDA path is
+        # deterministic and preserves gradients without that process failure.
+        if projected.is_cuda:
+            with torch.backends.cudnn.flags(enabled=False):
+                _, final_hidden = self.gru(packed)
+        else:
+            _, final_hidden = self.gru(packed)
         representation = final_hidden[-1]
 
         posterior_mean = self.posterior_mean(representation)
@@ -1248,7 +1255,7 @@ class IndependentLatentODE(VAE_Baseline):
             device=predictions.device,
             dtype=predictions.dtype,
         )
-        target_mask = batch.target_mask.to(
+        target_mask = batch.training_loss_mask.to(
             device=predictions.device,
             dtype=torch.bool,
         )

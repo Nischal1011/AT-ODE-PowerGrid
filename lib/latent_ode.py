@@ -937,6 +937,16 @@ class LatentGraphODE(VAE_Baseline):
                 dtype=first_point_enc.dtype,
             )
 
+            task = getattr(self, "powergrid_task", None)
+            if task == "extrapolation" and torch.any(
+                latest_observation_time
+                > time_steps_to_predict[0] + 1.0e-7
+            ):
+                raise AssertionError(
+                    "AT-ODE extrapolation requires every latest observation "
+                    "time to be at or before the forecast start."
+                )
+
             # Attention-transport route. The latest-observation tensor is
             # supplied directly by the data adapter and is not inferred here.
             sol_y = self.diffeq_solver(

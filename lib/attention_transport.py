@@ -1140,14 +1140,14 @@ class SolverSafeAttentionTransport(nn.Module):
         physical_edge_mask: Tensor,
     ) -> Tuple[Tensor, Tensor]:
         """
-        Normalize active incoming weights to have mean one.
+        Scale active incoming weights using the initial-time incoming mean.
 
         For every receiver node:
 
-            sum(normalized incoming weights) = active incoming degree
+            sum(normalized incoming weights at t0) = active incoming degree
 
         This keeps the message scale comparable to an LG-ODE control using
-        unit physical-edge weights.
+        unit physical-edge weights without cancelling later temporal decay.
 
         Parameters
         ----------
@@ -1163,8 +1163,8 @@ class SolverSafeAttentionTransport(nn.Module):
             Normalized edge weights [T, effective_batch, E].
 
         fallback_fraction
-            Fraction of receiver-time-batch groups that required the static
-            unit-weight fallback.
+            Fraction of receiver-batch groups that required the static
+            unit-weight fallback at the initial time.
         """
 
         if raw_edge_weight.ndim != 3:
@@ -1198,18 +1198,17 @@ class SolverSafeAttentionTransport(nn.Module):
 
         active_raw = raw_edge_weight * mask_float.unsqueeze(0)
 
-        incoming_sum = torch.zeros(
-            time_count,
+        initial_incoming_sum = torch.zeros(
             effective_batch,
             self.num_nodes,
             device=raw_edge_weight.device,
             dtype=raw_edge_weight.dtype,
         )
 
-        incoming_sum.index_add_(
-            dim=2,
+        initial_incoming_sum.index_add_(
+            dim=1,
             index=receiver_index,
-            source=active_raw,
+            source=active_raw[0],
         )
 
         incoming_degree = torch.zeros(
@@ -1225,11 +1224,10 @@ class SolverSafeAttentionTransport(nn.Module):
             source=mask_float,
         )
 
-        denominator = incoming_sum[
-            :,
+        denominator = initial_incoming_sum[
             :,
             receiver_index,
-        ]
+        ].unsqueeze(0)
 
         degree_per_edge = incoming_degree[
             :,
@@ -1261,16 +1259,14 @@ class SolverSafeAttentionTransport(nn.Module):
 
         receiver_has_edges = incoming_degree > 0.0
 
-        valid_receiver_sum = incoming_sum > self.epsilon
+        valid_receiver_sum = initial_incoming_sum > self.epsilon
 
         fallback_receiver = (
-            receiver_has_edges.unsqueeze(0)
-            & (~valid_receiver_sum)
+            receiver_has_edges & (~valid_receiver_sum)
         )
 
         denominator_count = torch.clamp(
-            receiver_has_edges.sum()
-            * time_count,
+            receiver_has_edges.sum(),
             min=1,
         )
 
@@ -1534,6 +1530,32 @@ class SolverSafeAttentionTransport(nn.Module):
             * active_mask_float.unsqueeze(0)
         ).max()
 
+        initial_active_weights = active_weights[0]
+        final_active_weights = active_weights[-1]
+        endpoint_absolute_change = torch.abs(
+            final_active_weights - initial_active_weights
+        ) * active_mask_float
+        mean_absolute_endpoint_change = (
+            endpoint_absolute_change.sum() / active_count
+        )
+        changed_active_edges = (
+            ~torch.isclose(
+                initial_active_weights,
+                final_active_weights,
+                rtol=1.0e-5,
+                atol=1.0e-7,
+            )
+        ).to(z0_reshaped.dtype) * active_mask_float
+        changed_active_edge_fraction = (
+            changed_active_edges.sum() / active_count
+        )
+        initial_active_edge_weight_mean = (
+            initial_active_weights * active_mask_float
+        ).sum() / active_count
+        final_active_edge_weight_mean = (
+            final_active_weights * active_mask_float
+        ).sum() / active_count
+
         represented_age_fraction = (
             (
                 age_grid < self.max_age
@@ -1554,6 +1576,14 @@ class SolverSafeAttentionTransport(nn.Module):
             "edge_weight_mean": edge_weight_mean,
             "edge_weight_min": edge_weight_min,
             "edge_weight_max": edge_weight_max,
+            "mean_absolute_first_last_edge_weight_change": (
+                mean_absolute_endpoint_change
+            ),
+            "changed_active_edge_fraction": changed_active_edge_fraction,
+            "initial_active_edge_weight_mean": (
+                initial_active_edge_weight_mean
+            ),
+            "final_active_edge_weight_mean": final_active_edge_weight_mean,
             "active_edge_fraction": active_edge_fraction,
             "represented_age_fraction": represented_age_fraction,
             "fallback_fraction": fallback_fraction,
@@ -1733,6 +1763,19 @@ def _self_test() -> Dict[str, float]:
 
     assert float(max_mass_drift.detach()) < 1.0e-5, (
         "Age-bin transport should preserve edge evidence mass."
+    )
+
+    mean_weight_change = cache.diagnostics[
+        "mean_absolute_first_last_edge_weight_change"
+    ]
+    changed_edge_fraction = cache.diagnostics[
+        "changed_active_edge_fraction"
+    ]
+    assert float(mean_weight_change.detach()) > 1.0e-7, (
+        "AT-ODE weights are numerically constant over a nonzero interval."
+    )
+    assert float(changed_edge_fraction.detach()) > 0.0, (
+        "No active AT-ODE edge changed over a nonzero interval."
     )
 
     loss = (

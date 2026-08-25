@@ -540,17 +540,15 @@ class DiffeqSolver(nn.Module):
     def candidate_edge_count(self) -> int:
         if not self.uses_graph:
             return 0
-        return self.num_atoms * (self.num_atoms - 1)
+        if self.physical_edge_index is None:
+            raise RuntimeError(
+                "Graph models require a physical_edge_index."
+            )
+        return int(self.physical_edge_index.shape[1])
 
     def compute_rec_send(self) -> Tuple[Tensor, Tensor]:
         """
-        Deterministically construct all directed non-self candidate pairs.
-
-        Ordering is receiver-major for compatibility with the original code:
-
-            receiver 0: senders 1, 2, ..., N-1
-            receiver 1: senders 0, 2, ..., N-1
-            ...
+        Construct relation matrices from the physical directed edges.
 
         Returns
         -------
@@ -560,26 +558,19 @@ class DiffeqSolver(nn.Module):
             [E, N] one-hot sender matrix.
         """
 
-        receiver_indices = []
-        sender_indices = []
+        if self.physical_edge_index is None:
+            raise ValueError(
+                "Graph relation matrices require physical_edge_index."
+            )
 
-        for receiver in range(self.num_atoms):
-            for sender in range(self.num_atoms):
-                if sender == receiver:
-                    continue
-                receiver_indices.append(receiver)
-                sender_indices.append(sender)
+        edge_index = self.physical_edge_index
+        if edge_index.ndim != 2 or edge_index.shape[0] != 2:
+            raise ValueError(
+                "physical_edge_index must have shape [2, E]."
+            )
 
-        receiver = torch.tensor(
-            receiver_indices,
-            dtype=torch.long,
-            device=self.device,
-        )
-        sender = torch.tensor(
-            sender_indices,
-            dtype=torch.long,
-            device=self.device,
-        )
+        sender = edge_index[0].long()
+        receiver = edge_index[1].long()
 
         rel_rec = F.one_hot(
             receiver,
@@ -590,9 +581,7 @@ class DiffeqSolver(nn.Module):
             num_classes=self.num_atoms,
         ).to(torch.float32)
 
-        expected_edges = self.num_atoms * (
-            self.num_atoms - 1
-        )
+        expected_edges = int(edge_index.shape[1])
         if rel_rec.shape != (
             expected_edges,
             self.num_atoms,
@@ -1211,6 +1200,16 @@ class DiffeqSolver(nn.Module):
             if raw_diagnostics is not None:
                 diagnostics = dict(raw_diagnostics)
 
+        elif hasattr(output, "edge_weights_at"):
+            provider = output.edge_weights_at
+            raw_diagnostics = getattr(
+                output,
+                "diagnostics",
+                {},
+            )
+            if raw_diagnostics is not None:
+                diagnostics = dict(raw_diagnostics)
+
         elif isinstance(output, Mapping):
             provider = output.get(
                 "provider",
@@ -1239,8 +1238,8 @@ class DiffeqSolver(nn.Module):
         if provider is None or not callable(provider):
             raise TypeError(
                 "Attention transport must return a callable provider, an "
-                "object with .provider, a mapping containing 'provider', "
-                "or (provider, diagnostics)"
+                "object with .provider or .edge_weights_at, a mapping "
+                "containing 'provider', or (provider, diagnostics)"
             )
 
         return TransportRuntimeOutput(
@@ -1308,17 +1307,9 @@ class DiffeqSolver(nn.Module):
 
         output = self.attention_transport(
             z0=initial_state,
-            latest_observation_time=latest_observation_time,
-            rel_send=self.rel_send.to(
-                device=initial_state.device,
-                dtype=initial_state.dtype,
-            ),
-            rel_rec=self.rel_rec.to(
-                device=initial_state.device,
-                dtype=initial_state.dtype,
-            ),
+            latest_observation_time=latest_observation_time.squeeze(-1),
             time_grid=integration_times,
-            physical_edge_mask=physical_edge_mask,
+            physical_edge_mask=physical_edge_mask.squeeze(-1),
         )
 
         runtime = self._normalize_transport_output(

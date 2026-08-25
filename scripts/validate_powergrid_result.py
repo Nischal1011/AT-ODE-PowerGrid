@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import subprocess
+from pathlib import Path
+from typing import Any, Dict
+
+
+EXPECTED_CONFIG: Dict[str, Any] = {
+    "observed_fraction": 0.4,
+    "batch_size": 8,
+    "stride": 24,
+    "niters": 200,
+    "patience": 25,
+    "min_delta": 0.0,
+    "lr": 5e-4,
+    "lr_patience": 8,
+    "lr_factor": 0.5,
+    "weight_decay": 0.0,
+    "optimizer": "adam",
+    "gradient_clip": 10.0,
+    "kl_coef": 1.0,
+    "kl_warmup_epochs": 10,
+    "train_samples": 1,
+    "eval_samples": 1,
+    "latent_dim": 16,
+    "recognition_dim": 64,
+    "ode_hidden_dim": 128,
+    "augmentation_dim": 0,
+    "encoder_layers": 2,
+    "ode_layers": 1,
+    "attention_heads": 1,
+    "edge_types": 2,
+    "dropout": 0.2,
+    "ode_dropout": 0.0,
+    "observation_std": 0.01,
+    "solver": "rk4",
+    "rtol": 1e-3,
+    "atol": 1e-4,
+    "transport_bins": 32,
+    "transport_max_age": 4.0,
+    "transport_hidden_dim": 64,
+    "transport_attention_dim": 16,
+    "transport_heads": 4,
+    "transport_speed": 1.0,
+    "transport_decay": 1.0,
+    "deterministic": True,
+    "num_workers": 0,
+    "eval_seed": 12345,
+    "graph_mode": "physical_sparse",
+}
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def equal(left: Any, right: Any) -> bool:
+    if isinstance(right, float):
+        return math.isclose(float(left), right, rel_tol=0.0, abs_tol=1e-12)
+    return left == right
+
+
+def validate(args: argparse.Namespace) -> None:
+    result = json.loads(args.result.read_text(encoding="utf-8"))
+    current_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    expected_identity = {
+        "model": args.model,
+        "task": args.task,
+        "seed": args.seed,
+        "mask_seed": args.seed,
+        "eval_seed": 12345,
+        "batch_size": 8,
+        "stride": 24,
+        "observed_fraction": 0.4,
+        "git_commit": current_commit,
+    }
+    for key, expected in expected_identity.items():
+        if key not in result or not equal(result[key], expected):
+            raise ValueError(
+                f"{args.result}: {key}={result.get(key)!r}, expected {expected!r}"
+            )
+
+    config = result.get("config", {})
+    for key, expected in EXPECTED_CONFIG.items():
+        if key not in config or not equal(config[key], expected):
+            raise ValueError(
+                f"{args.result}: config.{key}={config.get(key)!r}, "
+                f"expected {expected!r}"
+            )
+    expected_lengths = (
+        {"trajectory_length": 24}
+        if args.task == "interpolation"
+        else {"context_length": 12, "forecast_length": 12}
+    )
+    for key, expected in expected_lengths.items():
+        if not equal(result.get(key), expected):
+            raise ValueError(f"{args.result}: invalid {key}")
+
+    dataset = result.get("dataset", {})
+    if dataset.get("sha256") != sha256(args.data):
+        raise ValueError(f"{args.result}: dataset hash mismatch")
+    for key in ("window_hashes", "observation_mask_hashes", "edge_index_sha256"):
+        if not dataset.get(key):
+            raise ValueError(f"{args.result}: missing dataset.{key}")
+
+    fingerprint = json.loads(args.fingerprint.read_text(encoding="utf-8"))
+    for key in ("window_hashes", "observation_mask_hashes", "edge_index_hash"):
+        result_key = "edge_index_sha256" if key == "edge_index_hash" else key
+        if dataset.get(result_key) != fingerprint.get(key):
+            raise ValueError(f"{args.result}: protocol fingerprint mismatch for {key}")
+
+    test = result.get("test", {})
+    metric_key = (
+        "normalized_mse_unobserved"
+        if args.task == "interpolation"
+        else "normalized_mse_full"
+    )
+    mae_key = metric_key.replace("mse", "mae")
+    for key in (metric_key, mae_key):
+        value = float(test.get(key, float("nan")))
+        if not math.isfinite(value):
+            raise ValueError(f"{args.result}: nonfinite test.{key}")
+
+    expected_selection = (
+        "normalized_mse_unobserved"
+        if args.task == "interpolation"
+        else "normalized_mse_full"
+    )
+    if result.get("checkpoint_selection_metric") != expected_selection:
+        raise ValueError(f"{args.result}: wrong checkpoint selection metric")
+    if args.model in {"lgode", "atode"}:
+        if dataset.get("physical_directed_edge_count") != 194:
+            raise ValueError(f"{args.result}: expected 194 physical edges")
+        if dataset.get("candidate_directed_edge_count") != 194:
+            raise ValueError(f"{args.result}: expected 194 sparse candidates")
+        if not result.get("shared_initialization_sha256"):
+            raise ValueError(f"{args.result}: missing shared initialization hash")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--result", type=Path, required=True)
+    parser.add_argument("--data", type=Path, required=True)
+    parser.add_argument("--fingerprint", type=Path, required=True)
+    parser.add_argument("--model", choices=("persistence", "latentode", "lgode", "atode"), required=True)
+    parser.add_argument("--task", choices=("interpolation", "extrapolation"), required=True)
+    parser.add_argument("--seed", type=int, required=True)
+    args = parser.parse_args()
+    validate(args)
+    print(f"Validated completed result: {args.result}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
