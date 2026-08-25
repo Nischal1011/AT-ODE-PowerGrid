@@ -1,0 +1,60 @@
+{
+  "available_profile_steps": 35136,
+  "bus_count": 99,
+  "bus_features": [
+    "vm_pu",
+    "va_degree",
+    "p_mw",
+    "q_mvar"
+  ],
+  "directed_edge_count": 198,
+  "edge_types": {
+    "0": "line",
+    "1": "transformer",
+    "2": "closed_bus_switch"
+  },
+  "failed_profile_step_count": 0,
+  "failed_profile_steps": [],
+  "format_version": 2,
+  "generated_utc": "2026-08-23T01:04:56.295877+00:00",
+  "interval_minutes": 15.0,
+  "line_count": 95,
+  "line_features": [
+    "loading_percent",
+    "i_from_ka",
+    "i_to_ka",
+    "p_from_mw",
+    "q_from_mvar",
+    "pl_mw"
+  ],
+  "missingness": "Not generated. Downstream task loaders must generate deterministic observation subsets.",
+  "normalization": "Not applied during generation. Downstream loaders must fit normalization using the training interval only.",
+  "npz_file": "1-MV-rural--1-sw.npz",
+  "npz_sha256": "b65121c24bd54fbda5495c171b205867a5d32eae9e9ee50c1da517fe9b68d4cf",
+  "pandapower_version": "3.5.4",
+  "profile_start": 0,
+  "profile_stride": 1,
+  "requested_profile_steps": 35136,
+  "simbench_code": "1-MV-rural--1-sw",
+  "simbench_version": "1.6.2",
+  "split_fractions_requested": [
+    0.7,
+    0.15,
+    0.15
+  ],
+  "split_policy": "chronological",
+  "successful_profile_steps": 35136,
+  "test_range": [
+    29865,
+    35136
+  ],
+  "timestamps_preserve_skipped_gaps": true,
+  "train_range": [
+    0,
+    24595
+  ],
+  "validation_range": [
+    24595,
+    29865
+  ]
+}

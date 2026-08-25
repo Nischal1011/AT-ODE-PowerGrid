@@ -130,6 +130,10 @@ class ParsedResult:
     # Normalized-space metrics.
     normalized_test_mse: float
     normalized_test_mae: float
+    normalized_test_mse_full: float
+    normalized_test_mae_full: float
+    normalized_test_mse_unobserved: float
+    normalized_test_mae_unobserved: float
 
     # Physical-unit feature metrics.
     voltage_magnitude_mae_pu: float
@@ -171,6 +175,14 @@ class ParsedResult:
             "mask_seed": self.mask_seed,
             "normalized_test_mse": self.normalized_test_mse,
             "normalized_test_mae": self.normalized_test_mae,
+            "normalized_test_mse_full": self.normalized_test_mse_full,
+            "normalized_test_mae_full": self.normalized_test_mae_full,
+            "normalized_test_mse_unobserved": (
+                self.normalized_test_mse_unobserved
+            ),
+            "normalized_test_mae_unobserved": (
+                self.normalized_test_mae_unobserved
+            ),
             "voltage_magnitude_mae_pu": (
                 self.voltage_magnitude_mae_pu
             ),
@@ -617,6 +629,35 @@ def _parse_result_json(
             field_name="normalized test MAE",
         ),
         "normalized_test_mae",
+    )
+
+    normalized_test_mse_full = _to_float(
+        _candidate_value(
+            flattened,
+            ["test.normalized_mse_full"],
+            default=normalized_test_mse,
+        ),
+        "normalized_test_mse_full",
+    )
+    normalized_test_mae_full = _to_float(
+        _candidate_value(
+            flattened,
+            ["test.normalized_mae_full"],
+            default=normalized_test_mae,
+        ),
+        "normalized_test_mae_full",
+    )
+    normalized_test_mse_unobserved = _optional_float(
+        flattened,
+        ["test.normalized_mse_unobserved"],
+        "normalized_test_mse_unobserved",
+        required=False,
+    )
+    normalized_test_mae_unobserved = _optional_float(
+        flattened,
+        ["test.normalized_mae_unobserved"],
+        "normalized_test_mae_unobserved",
+        required=False,
     )
 
     # ------------------------------------------------------------------
@@ -1070,6 +1111,14 @@ def _parse_result_json(
         mask_seed=mask_seed,
         normalized_test_mse=normalized_test_mse,
         normalized_test_mae=normalized_test_mae,
+        normalized_test_mse_full=normalized_test_mse_full,
+        normalized_test_mae_full=normalized_test_mae_full,
+        normalized_test_mse_unobserved=(
+            normalized_test_mse_unobserved
+        ),
+        normalized_test_mae_unobserved=(
+            normalized_test_mae_unobserved
+        ),
         voltage_magnitude_mae_pu=voltage_magnitude_mae_pu,
         voltage_angle_mae_deg=voltage_angle_mae_deg,
         active_power_mae_mw=active_power_mae_mw,
@@ -1383,6 +1432,34 @@ def build_summary(
                 group,
                 "normalized_test_mae",
                 "normalized_mae",
+            )
+        )
+        row.update(
+            _metric_summary(
+                group,
+                "normalized_test_mse_full",
+                "normalized_mse_full",
+            )
+        )
+        row.update(
+            _metric_summary(
+                group,
+                "normalized_test_mae_full",
+                "normalized_mae_full",
+            )
+        )
+        row.update(
+            _metric_summary(
+                group,
+                "normalized_test_mse_unobserved",
+                "normalized_mse_unobserved",
+            )
+        )
+        row.update(
+            _metric_summary(
+                group,
+                "normalized_test_mae_unobserved",
+                "normalized_mae_unobserved",
             )
         )
         row.update(
@@ -1816,7 +1893,7 @@ def build_paired_comparisons(
             row["std_mse_improvement_model_a"] = row[
                 "std_normalized_test_mse_improvement_model_a"
             ]
-            row["mean_relative_mse_improvement_percent"] = row[
+            row["mean_relative_normalized_test_mse_improvement_percent"] = row[
                 "mean_relative_normalized_test_mse_improvement_percent"
             ]
             row["std_relative_mse_improvement_percent"] = row[
@@ -1992,7 +2069,7 @@ def _print_report(
         print("\nAT-ODE transport improvement over LG-ODE:")
 
         for row in transport.itertuples(index=False):
-            value = row.mean_relative_mse_improvement_percent
+            value = row.mean_relative_normalized_test_mse_improvement_percent
             pairs = row.number_of_pairs
 
             if pd.isna(value):

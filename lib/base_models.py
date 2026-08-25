@@ -278,6 +278,7 @@ class VAE_Baseline(nn.Module):
         batch_dict_graph,
         n_traj_samples=1,
         kl_coef=1.0,
+        sample_z0=True,
     ):
         """
         Compute the common VAE objective.
@@ -294,6 +295,7 @@ class VAE_Baseline(nn.Module):
             batch_dict_decoder,
             batch_dict_graph,
             n_traj_samples=n_traj_samples,
+            sample_z0=sample_z0,
         )
         # pred_y:
         # [n_traj_samples, n_traj, n_tp, n_dim]

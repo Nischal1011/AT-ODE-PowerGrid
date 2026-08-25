@@ -719,7 +719,7 @@ def _make_graph_ode_network(
         out_dim=config.ode_state_dim,
         n_heads=config.attention_heads,
         n_layers=config.ode_layers,
-        dropout=config.dropout,
+        dropout=0.0,
         conv_name=config.ode_type,
         aggregate="add",
     )
