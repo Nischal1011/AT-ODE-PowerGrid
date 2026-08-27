@@ -1192,6 +1192,57 @@ def kl_coefficient(
     return float(maximum) * fraction
 
 
+@torch.no_grad()
+def stable_clip_grad_norm(
+    parameters: Iterable[nn.Parameter],
+    max_norm: float,
+) -> Tensor:
+    gradients = [
+        parameter.grad
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+    if not gradients:
+        return torch.zeros((), dtype=torch.float64)
+
+    reference_device = gradients[0].device
+    squared_norm = torch.zeros(
+        (), dtype=torch.float64, device=reference_device
+    )
+    for gradient in gradients:
+        values = (
+            gradient.coalesce().values()
+            if gradient.is_sparse
+            else gradient
+        )
+        gradient_norm = torch.linalg.vector_norm(
+            values.detach(), ord=2, dtype=torch.float64
+        )
+        squared_norm += gradient_norm.to(reference_device).square()
+
+    total_norm = torch.sqrt(squared_norm)
+    if not torch.isfinite(total_norm):
+        raise FloatingPointError(
+            "Aggregate gradient norm is non-finite even in float64."
+        )
+
+    if max_norm > 0.0:
+        clip_coefficient = torch.clamp(
+            total_norm.new_tensor(float(max_norm))
+            / (total_norm + 1.0e-12),
+            max=1.0,
+        )
+        for gradient in gradients:
+            gradient.mul_(
+                clip_coefficient.to(
+                    device=gradient.device,
+                    dtype=gradient.dtype,
+                )
+            )
+
+    return total_norm
+
+
 def train_one_epoch(
     model: nn.Module,
     model_name: str,
@@ -1259,16 +1310,10 @@ def train_one_epoch(
                     f"{parameter_name!r}."
                 )
 
-        gradient_norm = nn.utils.clip_grad_norm_(
+        gradient_norm = stable_clip_grad_norm(
             model.parameters(),
-            max_norm=(
-                gradient_clip if gradient_clip > 0.0 else float("inf")
-            ),
+            max_norm=gradient_clip,
         )
-        if not torch.isfinite(gradient_norm):
-            raise FloatingPointError(
-                "Non-finite aggregate gradient norm."
-            )
 
         optimizer.step()
 
