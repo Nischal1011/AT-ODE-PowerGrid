@@ -1,0 +1,28 @@
+==============================================================================
+Power-grid LG-ODE benchmark
+model:                 persistence
+task:                  interpolation
+observed fraction:     0.4
+data:                  C:\Users\nsubedi\Documents\lgode\LG-ODE\data\simbench_paper\1-MV-rural--0-sw.npz
+SimBench code:         1-MV-rural--0-sw
+nodes:                 97
+features:              4
+physical edges:        194
+candidate pairs:        194
+device:                cuda
+parameters:            0
+trainable parameters:  0
+windows train/val/test: 1024/219/219
+result:                C:\Users\nsubedi\Documents\lgode\LG-ODE\results\protocol_v5_publication_both_tasks_obs40_bs8\protocol_v5_publication_both_tasks_obs40_bs8__interpolation__obs40__persistence__seed5.json
+checkpoint:            C:\Users\nsubedi\Documents\lgode\LG-ODE\checkpoints\protocol_v5_publication_both_tasks_obs40_bs8\protocol_v5_publication_both_tasks_obs40_bs8__interpolation__obs40__persistence__seed5.pt
+==============================================================================
+==============================================================================
+Final result
+best epoch:       0
+validation MSE:   0.03419293
+test MSE:         0.02486405
+test MAE:         0.03630219
+training seconds: 0.00
+test seconds:     6.47
+wrote:            C:\Users\nsubedi\Documents\lgode\LG-ODE\results\protocol_v5_publication_both_tasks_obs40_bs8\protocol_v5_publication_both_tasks_obs40_bs8__interpolation__obs40__persistence__seed5.json
+==============================================================================
