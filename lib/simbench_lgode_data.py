@@ -147,6 +147,7 @@ _BATCH_KEYS = (
     "training_loss_mask",
     "interpolation_withheld_mask",
     "extrapolation_future_mask",
+    "scenario_label",
     "trajectory_id",
 )
 
@@ -238,6 +239,7 @@ class PowerGridBatch(Mapping[str, Any]):
     training_loss_mask: Tensor
     interpolation_withheld_mask: Tensor
     extrapolation_future_mask: Tensor
+    scenario_label: Tensor
     trajectory_id: Tensor
 
     def __getitem__(self, key: str) -> Any:
@@ -285,6 +287,9 @@ class PowerGridBatch(Mapping[str, Any]):
             extrapolation_future_mask=self.extrapolation_future_mask.to(
                 device, non_blocking=non_blocking
             ),
+            scenario_label=self.scenario_label.to(
+                device, non_blocking=non_blocking
+            ),
             trajectory_id=self.trajectory_id.to(
                 device, non_blocking=non_blocking
             ),
@@ -320,6 +325,7 @@ class PowerGridBatch(Mapping[str, Any]):
             extrapolation_future_mask=(
                 self.extrapolation_future_mask.pin_memory()
             ),
+            scenario_label=self.scenario_label.pin_memory(),
             trajectory_id=self.trajectory_id.pin_memory(),
         )
 
@@ -1283,6 +1289,7 @@ class SimBenchLGODEDataset(Dataset):
             "training_loss_mask": training_loss_mask,
             "interpolation_withheld_mask": interpolation_withheld_mask,
             "extrapolation_future_mask": extrapolation_future_mask,
+            "scenario_label": torch.tensor(-1, dtype=torch.long),
             "trajectory_id": torch.tensor(
                 record.trajectory_id, dtype=torch.long
             ),
@@ -1336,6 +1343,9 @@ def collate_powergrid_lgode(
         [sample["extrapolation_future_mask"] for sample in samples],
         dim=0,
     )
+    scenario_label = torch.stack(
+        [sample["scenario_label"] for sample in samples], dim=0
+    ).long()
     trajectory_id = torch.stack(
         [sample["trajectory_id"] for sample in samples],
         dim=0,
@@ -1352,6 +1362,7 @@ def collate_powergrid_lgode(
         training_loss_mask=training_loss_mask,
         interpolation_withheld_mask=interpolation_withheld_mask,
         extrapolation_future_mask=extrapolation_future_mask,
+        scenario_label=scenario_label,
         trajectory_id=trajectory_id,
     )
 

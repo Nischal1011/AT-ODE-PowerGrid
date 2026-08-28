@@ -141,6 +141,11 @@ from lib.simbench_lgode_data import (
     PowerGridDataLoaders,
     build_simbench_dataloaders,
 )
+from lib.ieee39_transient_data import (
+    MASK_SCHEMA_VERSION,
+    build_ieee39_dataloaders,
+    observation_statistics,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +158,7 @@ SUPPORTED_TASKS = (
 )
 
 SUPPORTED_OBSERVED_FRACTIONS = (
+    0.2,
     0.4,
     0.6,
     0.8,
@@ -236,6 +242,20 @@ def git_commit() -> str:
         return completed.stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return "unknown"
+
+
+def git_dirty() -> bool:
+    try:
+        completed = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        return bool(completed.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        return True
 
 
 def sha256_file(path: Path) -> str:
@@ -528,7 +548,10 @@ def build_candidate_graph(
             "physical_edge_index must not contain self-edges."
         )
 
-    if graph_mode == "physical_sparse":
+    if graph_mode in {
+        "physical_sparse",
+        "complete_directed_generator_candidate",
+    }:
         candidate_edge_index = physical_edge_index.contiguous().clone()
         candidate_edge_labels = torch.ones(
             candidate_edge_index.shape[1],
@@ -557,11 +580,12 @@ def build_candidate_graph(
         )
         candidate_edge_labels = torch.tensor(labels, dtype=torch.long)
     else:
-        raise ValueError(
-            "graph_mode must be 'physical_sparse' or 'all_pairs_nri'."
-        )
+        raise ValueError("Unsupported graph_mode.")
 
-    if graph_mode == "physical_sparse" and (
+    if graph_mode in {
+        "physical_sparse",
+        "complete_directed_generator_candidate",
+    } and (
         candidate_edge_index.shape != physical_edge_index.shape
         or not torch.equal(candidate_edge_index, physical_edge_index)
     ):
@@ -570,7 +594,10 @@ def build_candidate_graph(
         )
 
     if (
-        graph_mode == "physical_sparse"
+        graph_mode in {
+            "physical_sparse",
+            "complete_directed_generator_candidate",
+        }
         and candidate_edge_index.shape[1] != physical_edge_index.shape[1]
     ):
         raise AssertionError(
@@ -582,7 +609,10 @@ def build_candidate_graph(
             "candidate_labels must contain one entry per candidate edge."
         )
 
-    if graph_mode == "physical_sparse" and not torch.all(
+    if graph_mode in {
+        "physical_sparse",
+        "complete_directed_generator_candidate",
+    } and not torch.all(
         candidate_edge_labels == 1
     ):
         raise AssertionError(
@@ -1013,6 +1043,126 @@ class MetricAccumulator:
         }
 
 
+class TransientMetricAccumulator:
+    def __init__(
+        self,
+        normalization: NormalizationStats,
+        feature_names: Sequence[str],
+    ) -> None:
+        self.mean = normalization.mean.detach().cpu().double()
+        self.std = normalization.std.detach().cpu().double()
+        self.feature_names = tuple(feature_names)
+        self.speed_index = self.feature_names.index("rotor_speed_pu")
+        self.maximum_speed_deviation_error = 0.0
+        self.speed_nadir_error = 0.0
+        self.speed_peak_error = 0.0
+        self.speed_series_count = 0
+        self.final_absolute_error = torch.zeros(
+            len(self.feature_names), dtype=torch.float64
+        )
+        self.final_count = 0
+        self.recovery_time_error = 0.0
+        self.recovery_count = 0
+
+    def update(
+        self,
+        prediction: Tensor,
+        truth: Tensor,
+        target_times: Tensor,
+    ) -> None:
+        prediction = prediction.detach().cpu().double()
+        truth = truth.detach().cpu().double()
+        times = target_times.detach().cpu().double()
+        mean = self.mean.reshape(1, 1, 1, -1)
+        std = self.std.reshape(1, 1, 1, -1)
+        physical_prediction = prediction * std + mean
+        physical_truth = truth * std + mean
+        final_error = torch.abs(
+            physical_prediction[:, :, -1] - physical_truth[:, :, -1]
+        )
+        self.final_absolute_error += final_error.sum(dim=(0, 1))
+        self.final_count += int(final_error.shape[0] * final_error.shape[1])
+
+        predicted_speed = physical_prediction[..., self.speed_index]
+        true_speed = physical_truth[..., self.speed_index]
+        predicted_deviation = torch.abs(predicted_speed - 1.0)
+        true_deviation = torch.abs(true_speed - 1.0)
+        self.maximum_speed_deviation_error += float(
+            torch.abs(
+                predicted_deviation.max(dim=-1).values
+                - true_deviation.max(dim=-1).values
+            ).sum()
+        )
+        self.speed_nadir_error += float(
+            torch.abs(
+                predicted_speed.min(dim=-1).values
+                - true_speed.min(dim=-1).values
+            ).sum()
+        )
+        self.speed_peak_error += float(
+            torch.abs(
+                predicted_speed.max(dim=-1).values
+                - true_speed.max(dim=-1).values
+            ).sum()
+        )
+        self.speed_series_count += int(
+            predicted_speed.shape[0] * predicted_speed.shape[1]
+        )
+
+        predicted_recovered = torch.flip(
+            torch.cumprod(
+                torch.flip(
+                    (predicted_deviation <= 0.005).long(), dims=(-1,)
+                ),
+                dim=-1,
+            ),
+            dims=(-1,),
+        ).bool()
+        true_recovered = torch.flip(
+            torch.cumprod(
+                torch.flip((true_deviation <= 0.005).long(), dims=(-1,)),
+                dim=-1,
+            ),
+            dims=(-1,),
+        ).bool()
+        valid = predicted_recovered.any(dim=-1) & true_recovered.any(dim=-1)
+        if torch.any(valid):
+            predicted_index = predicted_recovered.long().argmax(dim=-1)
+            true_index = true_recovered.long().argmax(dim=-1)
+            expanded_times = times.unsqueeze(1).expand_as(predicted_speed)
+            predicted_time = expanded_times.gather(
+                -1, predicted_index.unsqueeze(-1)
+            ).squeeze(-1)
+            true_time = expanded_times.gather(
+                -1, true_index.unsqueeze(-1)
+            ).squeeze(-1)
+            self.recovery_time_error += float(
+                torch.abs(predicted_time[valid] - true_time[valid]).sum()
+            )
+            self.recovery_count += int(valid.sum())
+
+    def compute(self) -> Dict[str, Any]:
+        denominator = max(self.speed_series_count, 1)
+        return {
+            "maximum_rotor_speed_deviation_mae_pu": (
+                self.maximum_speed_deviation_error / denominator
+            ),
+            "rotor_speed_nadir_mae_pu": self.speed_nadir_error / denominator,
+            "rotor_speed_peak_mae_pu": self.speed_peak_error / denominator,
+            "final_state_mae_by_feature": {
+                name: float(self.final_absolute_error[index] / max(self.final_count, 1))
+                for index, name in enumerate(self.feature_names)
+            },
+            "recovery_time_mae_seconds": (
+                self.recovery_time_error / self.recovery_count
+                if self.recovery_count > 0
+                else None
+            ),
+            "recovery_time_pair_count": self.recovery_count,
+            "recovery_tolerance_speed_pu": 0.005,
+        }
+
+
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
@@ -1044,6 +1194,12 @@ def evaluate(
     unobserved_accumulator = MetricAccumulator(
         normalization=normalization,
         feature_names=feature_names,
+    )
+    stability_accumulators: Dict[int, MetricAccumulator] = {}
+    transient_accumulator = (
+        TransientMetricAccumulator(normalization, feature_names)
+        if "rotor_speed_pu" in feature_names
+        else None
     )
 
     last_diagnostics: Dict[str, Any] = {}
@@ -1094,6 +1250,12 @@ def evaluate(
                 batch.target_values,
                 batch.target_mask,
             )
+            if transient_accumulator is not None:
+                transient_accumulator.update(
+                    mean_prediction,
+                    batch.target_values,
+                    batch.target_times,
+                )
 
             if task == "interpolation":
                 expected_mask_shape = batch.target_values.shape
@@ -1126,6 +1288,21 @@ def evaluate(
                 batch.target_values,
                 unobserved_mask,
             )
+
+            for label in (0, 1):
+                selected = batch.scenario_label == label
+                if not torch.any(selected):
+                    continue
+                if label not in stability_accumulators:
+                    stability_accumulators[label] = MetricAccumulator(
+                        normalization=normalization,
+                        feature_names=feature_names,
+                    )
+                stability_accumulators[label].update(
+                    mean_prediction[selected],
+                    batch.target_values[selected],
+                    unobserved_mask[selected],
+                )
 
             if diagnostics:
                 last_diagnostics = diagnostics
@@ -1169,6 +1346,13 @@ def evaluate(
             ],
         }
     )
+    if stability_accumulators:
+        metrics["by_stability"] = {
+            "unstable" if label == 0 else "stable": accumulator.compute()
+            for label, accumulator in stability_accumulators.items()
+        }
+    if transient_accumulator is not None:
+        metrics["transient"] = transient_accumulator.compute()
     return metrics, last_diagnostics
 
 
@@ -1356,6 +1540,7 @@ def checkpoint_payload(
         "validation_metrics": dict(validation_metrics),
         "arguments": vars(args),
         "git_commit": git_commit(),
+        "git_dirty": git_dirty(),
     }
 
 
@@ -1454,6 +1639,16 @@ def parse_args(
             "Direct SimBench NPZ path or a directory containing "
             "<simbench-code>.npz."
         ),
+    )
+    parser.add_argument(
+        "--dataset-format",
+        choices=("simbench", "ieee39_transient"),
+        default="simbench",
+    )
+    parser.add_argument(
+        "--scenario-scale",
+        choices=("smoke", "development", "publication"),
+        default="publication",
     )
     parser.add_argument(
         "--simbench-code",
@@ -1576,6 +1771,11 @@ def parse_args(
         help="Early-stopping patience; zero disables early stopping.",
     )
     parser.add_argument(
+        "--validation-interval",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
         "--min-delta",
         type=float,
         default=0.0,
@@ -1648,7 +1848,11 @@ def parse_args(
     )
     parser.add_argument(
         "--graph-mode",
-        choices=("physical_sparse", "all_pairs_nri"),
+        choices=(
+            "physical_sparse",
+            "all_pairs_nri",
+            "complete_directed_generator_candidate",
+        ),
         default="physical_sparse",
     )
     parser.add_argument(
@@ -1835,6 +2039,7 @@ def validate_args(args: argparse.Namespace) -> None:
         "edge_types",
         "train_samples",
         "eval_samples",
+        "validation_interval",
         "transport_bins",
         "transport_hidden_dim",
         "transport_attention_dim",
@@ -1948,9 +2153,13 @@ def run_experiment(
             }
         )
 
-    loaders: PowerGridDataLoaders = (
-        build_simbench_dataloaders(**data_arguments)
-    )
+    if args.dataset_format == "ieee39_transient":
+        loaders = build_ieee39_dataloaders(
+            **data_arguments,
+            scale=args.scenario_scale,
+        )
+    else:
+        loaders = build_simbench_dataloaders(**data_arguments)
 
     archive = loaders.archive
     resolved_data_path = archive.path.resolve()
@@ -1979,6 +2188,11 @@ def run_experiment(
     data_sha256 = sha256_file(resolved_data_path)
     protocol_manifest = dataset_protocol_manifest(loaders)
     edge_index_hash = sha256_tensor(candidate_edge_index)
+    ieee39_observation_stats = (
+        observation_statistics(loaders.train.dataset)
+        if args.dataset_format == "ieee39_transient"
+        else None
+    )
     protocol_fingerprint = {
         "data_sha256": data_sha256,
         "task": args.task,
@@ -1990,6 +2204,13 @@ def run_experiment(
         "seed": args.seed,
         "mask_seed": args.mask_seed,
         "graph_mode": args.graph_mode,
+        "dataset_format": args.dataset_format,
+        "scenario_scale": args.scenario_scale,
+        "mask_schema_version": (
+            MASK_SCHEMA_VERSION
+            if args.dataset_format == "ieee39_transient"
+            else None
+        ),
         "train_end": archive.train_end,
         "validation_end": archive.validation_end,
         "edge_index_hash": edge_index_hash,
@@ -2089,6 +2310,7 @@ def run_experiment(
     if not args.quiet:
         print("=" * 78)
         print("Power-grid LG-ODE benchmark")
+        print(f"dataset format:        {args.dataset_format}")
         print(f"model:                 {args.model}")
         print(f"task:                  {args.task}")
         print(f"observed fraction:     {args.observed_fraction}")
@@ -2187,6 +2409,26 @@ def run_experiment(
                 gradient_clip=args.gradient_clip,
                 max_batches=args.max_train_batches,
             )
+
+            should_validate = (
+                epoch % args.validation_interval == 0
+                or epoch == args.niters
+            )
+            if not should_validate:
+                epoch_elapsed = time.perf_counter() - epoch_start
+                training_history.append(
+                    {
+                        "epoch": epoch,
+                        "training": train_metrics,
+                        "validation": None,
+                        "learning_rate": float(
+                            optimizer.param_groups[0]["lr"]
+                        ),
+                        "improved": False,
+                        "epoch_time_seconds": epoch_elapsed,
+                    }
+                )
+                continue
 
             validation_metrics, validation_diagnostics = evaluate(
                 model,
@@ -2368,9 +2610,21 @@ def run_experiment(
         "eval_samples": args.eval_samples,
         "simbench_code": simbench_code,
         "git_commit": git_commit(),
+        "git_dirty": git_dirty(),
         "dataset": {
             "path": str(resolved_data_path),
             "sha256": data_sha256,
+            "source_path": str(
+                getattr(archive, "source_path", resolved_data_path)
+            ),
+            "source_sha256": archive.metadata.get(
+                "source_sha256", data_sha256
+            ),
+            "processed_sha256": archive.metadata.get(
+                "processed_sha256", data_sha256
+            ),
+            "dataset_format": args.dataset_format,
+            "scenario_scale": args.scenario_scale,
             "simbench_code": simbench_code,
             "num_timesteps": archive.num_timesteps,
             "num_nodes": archive.num_nodes,
@@ -2388,7 +2642,23 @@ def run_experiment(
             "train_end": archive.train_end,
             "validation_end": archive.validation_end,
             "test_end": archive.num_timesteps,
+            "num_scenarios": getattr(archive, "num_scenarios", None),
+            "generator_order": list(
+                getattr(archive, "generator_names", [])
+            ),
+            "feature_units": list(
+                getattr(archive, "feature_units", [])
+            ),
             "edge_index_sha256": edge_index_hash,
+            "graph_sha256": archive.metadata.get(
+                "graph_sha256", edge_index_hash
+            ),
+            "observation_statistics": ieee39_observation_stats,
+            "mask_schema_version": (
+                MASK_SCHEMA_VERSION
+                if args.dataset_format == "ieee39_transient"
+                else None
+            ),
             **protocol_manifest,
             "metadata": archive.metadata,
             "normalization": normalizer,

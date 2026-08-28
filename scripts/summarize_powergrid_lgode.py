@@ -93,6 +93,7 @@ TASK_ORDER = [
 ]
 
 OBSERVATION_FRACTION_ORDER = [
+    0.2,
     0.4,
     0.6,
     0.8,
@@ -108,6 +109,9 @@ PHYSICAL_METRIC_COLUMNS = [
     "voltage_magnitude_mae_pu",
     "voltage_angle_mae_deg",
     "active_power_mae_mw",
+    "excitation_current_mae_pu",
+    "rotor_speed_mae_pu",
+    "relative_rotor_angle_mae_deg",
     "reactive_power_mae_mvar",
     "ac_active_power_residual_mae_mw",
     "ac_reactive_power_residual_mae_mvar",
@@ -140,6 +144,9 @@ class ParsedResult:
     voltage_angle_mae_deg: float
     active_power_mae_mw: float
     reactive_power_mae_mvar: float
+    excitation_current_mae_pu: float
+    rotor_speed_mae_pu: float
+    relative_rotor_angle_mae_deg: float
 
     # Physics-consistency metrics.
     ac_active_power_residual_mae_mw: float
@@ -189,6 +196,9 @@ class ParsedResult:
             "voltage_angle_mae_deg": self.voltage_angle_mae_deg,
             "active_power_mae_mw": self.active_power_mae_mw,
             "reactive_power_mae_mvar": self.reactive_power_mae_mvar,
+            "excitation_current_mae_pu": self.excitation_current_mae_pu,
+            "rotor_speed_mae_pu": self.rotor_speed_mae_pu,
+            "relative_rotor_angle_mae_deg": self.relative_rotor_angle_mae_deg,
             "ac_active_power_residual_mae_mw": (
                 self.ac_active_power_residual_mae_mw
             ),
@@ -452,7 +462,7 @@ def _normalize_observed_fraction(value: Any) -> float:
             return allowed
 
     raise ValueError(
-        "observed_fraction must be 0.4, 0.6 or 0.8; "
+        "observed_fraction must be 0.2, 0.4, 0.6 or 0.8; "
         f"got {fraction}"
     )
 
@@ -682,6 +692,8 @@ def _parse_result_json(
     voltage_magnitude_mae_pu = _optional_float(
         flattened,
         [
+            "test.physical_per_feature_unobserved.terminal_voltage_pu.mae",
+            "test.physical_per_feature_full.terminal_voltage_pu.mae",
             "voltage_magnitude_mae_pu",
             "test.voltage_magnitude_mae_pu",
             "test.physical.voltage_magnitude_mae_pu",
@@ -722,6 +734,8 @@ def _parse_result_json(
     active_power_mae_mw = _optional_float(
         flattened,
         [
+            "test.physical_per_feature_unobserved.active_power_mw.mae",
+            "test.physical_per_feature_full.active_power_mw.mae",
             "active_power_mae_mw",
             "test.active_power_mae_mw",
             "test.physical.active_power_mae_mw",
@@ -757,6 +771,34 @@ def _parse_result_json(
         ],
         "reactive_power_mae_mvar",
         required=require_physical_metrics,
+    )
+
+    excitation_current_mae_pu = _optional_float(
+        flattened,
+        [
+            "test.physical_per_feature_unobserved.excitation_current_pu.mae",
+            "test.physical_per_feature_full.excitation_current_pu.mae",
+        ],
+        "excitation_current_mae_pu",
+        required=False,
+    )
+    rotor_speed_mae_pu = _optional_float(
+        flattened,
+        [
+            "test.physical_per_feature_unobserved.rotor_speed_pu.mae",
+            "test.physical_per_feature_full.rotor_speed_pu.mae",
+        ],
+        "rotor_speed_mae_pu",
+        required=False,
+    )
+    relative_rotor_angle_mae_deg = _optional_float(
+        flattened,
+        [
+            "test.physical_per_feature_unobserved.relative_rotor_angle_deg.mae",
+            "test.physical_per_feature_full.relative_rotor_angle_deg.mae",
+        ],
+        "relative_rotor_angle_mae_deg",
+        required=False,
     )
 
     # ------------------------------------------------------------------
@@ -1138,6 +1180,9 @@ def _parse_result_json(
         voltage_angle_mae_deg=voltage_angle_mae_deg,
         active_power_mae_mw=active_power_mae_mw,
         reactive_power_mae_mvar=reactive_power_mae_mvar,
+        excitation_current_mae_pu=excitation_current_mae_pu,
+        rotor_speed_mae_pu=rotor_speed_mae_pu,
+        relative_rotor_angle_mae_deg=relative_rotor_angle_mae_deg,
         ac_active_power_residual_mae_mw=(
             ac_active_power_residual_mae_mw
         ),
@@ -1503,6 +1548,27 @@ def build_summary(
                 group,
                 "reactive_power_mae_mvar",
                 "reactive_power_mae_mvar",
+            )
+        )
+        row.update(
+            _metric_summary(
+                group,
+                "excitation_current_mae_pu",
+                "excitation_current_mae_pu",
+            )
+        )
+        row.update(
+            _metric_summary(
+                group,
+                "rotor_speed_mae_pu",
+                "rotor_speed_mae_pu",
+            )
+        )
+        row.update(
+            _metric_summary(
+                group,
+                "relative_rotor_angle_mae_deg",
+                "relative_rotor_angle_mae_deg",
             )
         )
         row.update(

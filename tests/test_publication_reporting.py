@@ -29,6 +29,7 @@ class PublicationReportingTests(unittest.TestCase):
                     records.append(
                         {
                             "task": task,
+                            "observed_fraction": 0.4,
                             "model": model,
                             "seed": seed,
                             "test": {

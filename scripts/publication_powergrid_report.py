@@ -93,12 +93,16 @@ def bootstrap_mean_ci(values: np.ndarray, seed: int = 12345) -> Tuple[float, flo
 
 
 def holm_adjust(p_values: Sequence[float]) -> List[float]:
-    order = np.argsort(p_values)
-    adjusted = np.empty(len(p_values), dtype=float)
+    values = np.asarray(p_values, dtype=float)
+    finite_indices = np.flatnonzero(np.isfinite(values))
+    adjusted = np.full(len(values), np.nan, dtype=float)
+    if finite_indices.size == 0:
+        return adjusted.tolist()
+    order = finite_indices[np.argsort(values[finite_indices])]
     running = 0.0
-    count = len(p_values)
+    count = len(order)
     for rank, index in enumerate(order):
-        running = max(running, (count - rank) * p_values[index])
+        running = max(running, (count - rank) * values[index])
         adjusted[index] = min(1.0, running)
     return adjusted.tolist()
 
@@ -134,6 +138,7 @@ def build_statistics(records: Sequence[Dict[str, Any]]):
             summaries.append(
                 {
                     "task": task,
+                    "observed_fraction": group[0]["observed_fraction"],
                     "model": model,
                     "seeds": len(group),
                     "primary_mse_mean": mse_stats[0],
@@ -164,23 +169,36 @@ def build_statistics(records: Sequence[Dict[str, Any]]):
                 [indexed[(task, reference, seed)]["_primary_mse"] for seed in seeds]
             )
             differences = candidate_values - reference_values
-            difference_std = differences.std(ddof=1)
+            difference_std = (
+                differences.std(ddof=1)
+                if differences.size > 1
+                else float("nan")
+            )
             effect_size = (
                 float(differences.mean() / difference_std)
                 if difference_std > 0
                 else float("nan")
             )
-            t_result = stats.ttest_rel(candidate_values, reference_values)
-            try:
-                wilcoxon_p = float(
-                    stats.wilcoxon(candidate_values, reference_values).pvalue
+            if differences.size > 1:
+                t_p = float(
+                    stats.ttest_rel(candidate_values, reference_values).pvalue
                 )
-            except ValueError:
+                try:
+                    wilcoxon_p = float(
+                        stats.wilcoxon(candidate_values, reference_values).pvalue
+                    )
+                except ValueError:
+                    wilcoxon_p = float("nan")
+            else:
+                t_p = float("nan")
                 wilcoxon_p = float("nan")
             bootstrap_low, bootstrap_high = bootstrap_mean_ci(differences)
             comparisons.append(
                 {
                     "task": task,
+                    "observed_fraction": indexed[
+                        (task, candidate, seeds[0])
+                    ]["observed_fraction"],
                     "candidate": candidate,
                     "reference": reference,
                     "seeds": len(seeds),
@@ -191,7 +209,7 @@ def build_statistics(records: Sequence[Dict[str, Any]]):
                         / reference_values.mean()
                     ),
                     "paired_effect_size_dz": effect_size,
-                    "paired_t_p": float(t_result.pvalue),
+                    "paired_t_p": t_p,
                     "wilcoxon_p": wilcoxon_p,
                     "bootstrap_mean_difference_ci95_low": bootstrap_low,
                     "bootstrap_mean_difference_ci95_high": bootstrap_high,
