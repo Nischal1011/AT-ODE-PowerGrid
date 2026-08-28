@@ -1,6 +1,9 @@
 
 # AT-ODE generated datasets and outputs
 data/simbench/
+data/ieee39_transient/raw/
+data/ieee39_transient/processed/
+logs/ieee39_transient_*/
 results/
 experiments/
 checkpoints/
@@ -24,3 +27,11 @@ env/
 .vscode/
 .idea/
 .DS_Store
+
+# Generated experiment artifacts
+/logs/
+/results/
+/checkpoints/
+/publication_driver_logs/
+/data/ieee39_transient/raw/
+/data/ieee39_transient/processed/
